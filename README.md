@@ -6,9 +6,9 @@ OPPO 远控分辨率助手是一个 macOS 分辨率助手，适用于使用 O+ C
 
 <p align="center">macOS 实际界面 · 悬浮按钮跟随 O+ Connect 窗口</p>
 
-![折叠屏手机展开后查看 Mac 远控桌面的效果示意](docs/images/foldable-remote-find-n6.png)
+![折叠屏展开后的 Mac 远控画面，底部显示远控工具条和电脑键盘](docs/images/foldable-remote-redacted.png)
 
-<p align="center">外观参考 OPPO Find N6 / N5 · 远控画面为虚构示意</p>
+<p align="center">外观参考 OPPO Find N6 / N5 · 远控画面根据实拍截图脱敏重绘</p>
 
 ## 下载与使用
 
