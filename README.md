@@ -2,6 +2,10 @@
 
 OPPO 远控分辨率助手是一个 macOS 分辨率助手，适用于使用 O+ Connect（OPPO 互联）远控 Mac 的场景。
 
+![O+ Connect 窗口旁的「手机友好」和「恢复」悬浮按钮，底部显示当前分辨率](docs/images/showcase.png)
+
+<p align="center">macOS 实际界面 · 悬浮按钮跟随 O+ Connect 窗口</p>
+
 ## 下载与使用
 
 1. 从 [GitHub Releases](https://github.com/firzen/oppo-remote-scale/releases/latest) 下载通用版 ZIP。
