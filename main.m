@@ -1,11 +1,12 @@
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/graphics/IOGraphicsTypes.h>
 #import <libproc.h>
 #import <sys/stat.h>
 
 static NSString *const daemonSuffix = @"/O+Connect.app/Contents/Resources/daemon/oplus_remote_service";
-static const size_t preferredRemoteWidth = 1280;
-static const size_t preferredRemoteHeight = 800;
+static const size_t preferredRemoteWidth = 1152;
+static const size_t preferredRemoteHeight = 720;
 
 static BOOL IsRemoteDaemon(NSNumber *pid) {
     char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
@@ -190,6 +191,27 @@ static BOOL IsPreferredRemoteMode(CGDisplayModeRef mode) {
            CGDisplayModeGetHeight(mode) == preferredRemoteHeight;
 }
 
+static CGDisplayModeRef CopyFactoryRestoreMode(CGDirectDisplayID screen, CGDisplayModeRef current) {
+    if (!IsPreferredRemoteMode(current) || !CGDisplayIsBuiltin(screen)) return NULL;
+
+    NSDictionary *options = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
+    NSArray *modes = CFBridgingRelease(CGDisplayCopyAllDisplayModes(screen, (__bridge CFDictionaryRef)options));
+    CGDisplayModeRef best = NULL;
+    double bestDifference = INFINITY;
+    for (id object in modes) {
+        CGDisplayModeRef mode = (__bridge CGDisplayModeRef)object;
+        if (!(CGDisplayModeGetIOFlags(mode) & kDisplayModeDefaultFlag) ||
+            IsPreferredRemoteMode(mode) || !CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
+
+        double difference = fabs(CGDisplayModeGetRefreshRate(mode) - CGDisplayModeGetRefreshRate(current));
+        if (difference < bestDifference) {
+            best = mode;
+            bestDifference = difference;
+        }
+    }
+    return best ? CGDisplayModeRetain(best) : NULL;
+}
+
 static CGDisplayModeRef CopyRemoteMode(CGDirectDisplayID screen, CGDisplayModeRef current) {
     if (IsPreferredRemoteMode(current)) return NULL;
 
@@ -209,7 +231,9 @@ static CGDisplayModeRef CopyRemoteMode(CGDirectDisplayID screen, CGDisplayModeRe
             !CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
 
         double score = fabs((double)w - preferredRemoteWidth) * 100 + fabs(CGDisplayModeGetRefreshRate(mode) - refresh);
-        if (CGDisplayModeGetPixelWidth(mode) <= w) score += 50;
+        // Prefer the standard pixel mode at the target size for remote capture.
+        BOOL hiDPI = CGDisplayModeGetPixelWidth(mode) > w;
+        if (IsPreferredRemoteMode(mode) ? hiDPI : !hiDPI) score += 50;
         if (score < bestScore) {
             best = mode;
             bestScore = score;
@@ -287,7 +311,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
                                                             name:NSWorkspaceDidActivateApplicationNotification
                                                           object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self
-                                          selector:@selector(positionDesktopFeedback:)
+                                          selector:@selector(displayParametersDidChange:)
                                               name:NSApplicationDidChangeScreenParametersNotification
                                             object:nil];
     [self refreshStatus];
@@ -340,7 +364,14 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     self.panel.contentView = background;
 
     self.landscapeButton = [self controlWithTitle:@"手机友好" symbol:@"display" action:@selector(applyManually:)];
-    self.landscapeButton.toolTip = @"手机友好分辨率 1280 × 800";
+    [self.landscapeButton setButtonType:NSButtonTypeToggle];
+    self.landscapeButton.alternateTitle = @"手机友好";
+    NSImage *selectedImage = [NSImage imageWithSystemSymbolName:@"checkmark.circle.fill"
+                                       accessibilityDescription:nil];
+    self.landscapeButton.alternateImage = [selectedImage imageWithSymbolConfiguration:
+        [NSImageSymbolConfiguration configurationWithPointSize:26 weight:NSFontWeightRegular]];
+    self.landscapeButton.toolTip = [NSString stringWithFormat:@"手机友好分辨率 %zu × %zu",
+                                    preferredRemoteWidth, preferredRemoteHeight];
     self.restoreButton = [self controlWithTitle:@"恢复" symbol:@"arrow.counterclockwise"
                                          action:@selector(restoreManually:)];
     self.restoreButton.toolTip = @"恢复切换前的分辨率";
@@ -437,6 +468,11 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     NSSize size = self.feedbackPanel.frame.size;
     [self.feedbackPanel setFrameOrigin:NSMakePoint(NSMidX(visible) - size.width / 2,
                                                    NSMaxY(visible) - size.height - 44)];
+}
+
+- (void)displayParametersDidChange:(NSNotification *)notification {
+    [self positionDesktopFeedback:notification];
+    [self refreshStatus];
 }
 
 - (void)hideDesktopFeedback {
@@ -575,6 +611,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     } else if (disconnected) {
         _nextAutomaticCheck = 0;
         _waitingForDesktop = NO;
+        [self prepareFactoryRestoreMode];
         if (_originalMode && [self desktopIsReady]) {
             [self performDisplayChangeWithStatus:@"正在恢复原分辨率…" desktopFeedback:YES change:^BOOL{
                 [self restoreMode:NO];
@@ -657,6 +694,18 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 
 - (void)refreshStatus {
     BOOL busy = self.pendingStatus != nil;
+    CGDirectDisplayID screen = _originalMode ? _screen : CGMainDisplayID();
+    CGDisplayModeRef current = CGDisplayCopyDisplayMode(screen);
+    BOOL remoteSelected = IsPreferredRemoteMode(current) ||
+                          (current && _remoteMode && CFEqual(current, _remoteMode));
+    NSControlStateValue remoteState = remoteSelected ? NSControlStateValueOn : NSControlStateValueOff;
+    NSString *status = self.modeStatus;
+    if (current && (!status || (remoteSelected && !_originalMode))) status = DisplayModeStatus(current);
+    CGDisplayModeRef defaultMode = !busy && !_originalMode ? CopyFactoryRestoreMode(screen, current) : NULL;
+    BOOL canRestore = _originalMode || defaultMode;
+    if (defaultMode) CGDisplayModeRelease(defaultMode);
+    if (current) CGDisplayModeRelease(current);
+
     if (busy && self.statusSpinner.hidden) {
         self.statusSpinner.hidden = NO;
         [self.statusSpinner startAnimation:nil];
@@ -664,11 +713,13 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
         [self.statusSpinner stopAnimation:nil];
         self.statusSpinner.hidden = YES;
     }
-    self.statusLabel.stringValue = self.pendingStatus ?: (self.modeStatus ?: @"当前为原分辨率");
+    self.statusLabel.stringValue = self.pendingStatus ?: (status ?: @"无法读取当前分辨率");
     self.panel.accessibilityLabel = self.statusLabel.stringValue;
-    self.landscapeButton.enabled = !busy && _originalMode == NULL;
-    self.restoreButton.enabled = !busy && _originalMode != NULL;
+    self.landscapeButton.state = remoteState;
+    self.landscapeButton.enabled = !busy && (remoteSelected || _originalMode == NULL);
+    self.restoreButton.enabled = !busy && canRestore;
     self.statusMenuLabel.title = self.statusLabel.stringValue;
+    self.landscapeMenuItem.state = remoteState;
     self.landscapeMenuItem.enabled = self.landscapeButton.enabled;
     self.restoreMenuItem.enabled = self.restoreButton.enabled;
 }
@@ -715,8 +766,31 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     });
 }
 
+- (void)prepareFactoryRestoreMode {
+    if (_originalMode) return;
+
+    CGDirectDisplayID screen = CGMainDisplayID();
+    CGDisplayModeRef current = CGDisplayCopyDisplayMode(screen);
+    CGDisplayModeRef fallback = CopyFactoryRestoreMode(screen, current);
+    if (!fallback) {
+        if (current) CGDisplayModeRelease(current);
+        return;
+    }
+
+    _screen = screen;
+    _originalMode = fallback;
+    _remoteMode = current;
+}
+
 - (void)performManualChangeRestoring:(BOOL)restoring {
-    if (self.pendingStatus || restoring != (_originalMode != NULL)) return;
+    if (self.pendingStatus || (!restoring && _originalMode)) return;
+    if (restoring) {
+        [self prepareFactoryRestoreMode];
+        if (!_originalMode) {
+            [self refreshStatus];
+            return;
+        }
+    }
 
     _nextAutomaticCheck = 0;
     NSString *status = restoring ? @"正在恢复原分辨率…" : [self switchingStatus];
@@ -736,6 +810,10 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 - (void)applyManually:(id)sender {
+    if (_originalMode) {
+        [self refreshStatus];
+        return;
+    }
     [self performManualChangeRestoring:NO];
 }
 
