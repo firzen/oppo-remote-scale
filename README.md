@@ -6,6 +6,10 @@ OPPO 远控分辨率助手是一个 macOS 分辨率助手，适用于使用 O+ C
 
 <p align="center">macOS 实际界面 · 悬浮按钮跟随 O+ Connect 窗口</p>
 
+![折叠屏手机展开后查看 Mac 远控桌面的效果示意](docs/images/foldable-remote-demo.png)
+
+<p align="center">折叠屏远控效果示意 · 画面为虚构演示内容</p>
+
 ## 下载与使用
 
 1. 从 [GitHub Releases](https://github.com/firzen/oppo-remote-scale/releases/latest) 下载通用版 ZIP。
