@@ -2,7 +2,7 @@
 set -eu
 
 cd "$(dirname "$0")"
-app="build/RemoteScale.app"
+app="build/OPPO 远控分辨率助手.app"
 mkdir -p "$app/Contents/MacOS"
 
 xcrun clang -arch x86_64 -arch arm64 -fobjc-arc -Wall -Wextra -Wno-unused-parameter \
