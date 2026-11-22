@@ -173,6 +173,14 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
             CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode)];
 }
 
+static BOOL SessionIsUnlocked(NSDictionary *session) {
+    // WindowServer omits the lock flag in an unlocked session.
+    id locked = session[@"CGSSessionScreenIsLocked"];
+    return [session[(__bridge NSString *)kCGSessionLoginDoneKey] isEqual:@YES] &&
+           [session[(__bridge NSString *)kCGSessionOnConsoleKey] isEqual:@YES] &&
+           (!locked || [locked isEqual:@NO]);
+}
+
 @interface MenuController : NSObject <NSApplicationDelegate>
 @property (strong) NSPanel *panel;
 @property (strong) NSStatusItem *statusItem;
@@ -183,6 +191,11 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
 @property (strong) NSButton *landscapeButton;
 @property (strong) NSButton *restoreButton;
 @property (strong) NSTextField *statusLabel;
+@property (strong) NSProgressIndicator *statusSpinner;
+@property (strong) NSPanel *feedbackPanel;
+@property (strong) NSTextField *feedbackLabel;
+@property (strong) NSProgressIndicator *feedbackSpinner;
+@property (strong) NSTimer *feedbackDismissTimer;
 @property (copy) NSString *pendingStatus;
 @property (strong) SessionMonitor *monitor;
 @property (strong) NSTimer *timer;
@@ -195,6 +208,7 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
     CGDisplayModeRef _remoteMode;
     BOOL _restorePending;
     NSTimeInterval _nextAutomaticCheck;
+    BOOL _waitingForDesktop;
     NSUInteger _automaticAttempts;
     BOOL _automaticModeRequested;
     NSTimeInterval _lastVisibleWindow;
@@ -213,6 +227,14 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
     [self.monitor poll];
     self.timer = [NSTimer timerWithTimeInterval:1 target:self selector:@selector(poll:) userInfo:nil repeats:YES];
     [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+    [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self
+                                                        selector:@selector(desktopApplicationDidActivate:)
+                                                            name:NSWorkspaceDidActivateApplicationNotification
+                                                          object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                          selector:@selector(positionDesktopFeedback:)
+                                              name:NSApplicationDidChangeScreenParametersNotification
+                                            object:nil];
     [self refreshStatus];
 }
 
@@ -276,7 +298,12 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
     self.statusLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
     self.statusLabel.textColor = NSColor.secondaryLabelColor;
 
-    NSStackView *controls = [NSStackView stackViewWithViews:@[buttons, self.statusLabel]];
+    self.statusSpinner = [self makeStatusSpinner];
+    NSStackView *status = [NSStackView stackViewWithViews:@[self.statusSpinner, self.statusLabel]];
+    status.alignment = NSLayoutAttributeCenterY;
+    status.spacing = 6;
+
+    NSStackView *controls = [NSStackView stackViewWithViews:@[buttons, status]];
     controls.orientation = NSUserInterfaceLayoutOrientationVertical;
     controls.alignment = NSLayoutAttributeCenterX;
     controls.spacing = 8;
@@ -286,10 +313,100 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
         [controls.centerXAnchor constraintEqualToAnchor:background.centerXAnchor],
         [controls.centerYAnchor constraintEqualToAnchor:background.centerYAnchor],
         [buttons.widthAnchor constraintEqualToConstant:252],
-        [self.statusLabel.widthAnchor constraintEqualToAnchor:buttons.widthAnchor],
+        [status.widthAnchor constraintLessThanOrEqualToAnchor:buttons.widthAnchor],
+        [self.statusSpinner.widthAnchor constraintEqualToConstant:14],
+        [self.statusSpinner.heightAnchor constraintEqualToConstant:14],
         [self.landscapeButton.heightAnchor constraintEqualToConstant:84],
         [self.restoreButton.heightAnchor constraintEqualToAnchor:self.landscapeButton.heightAnchor]
     ]];
+}
+
+- (NSProgressIndicator *)makeStatusSpinner {
+    NSProgressIndicator *spinner = [NSProgressIndicator new];
+    spinner.style = NSProgressIndicatorStyleSpinning;
+    spinner.controlSize = NSControlSizeSmall;
+    spinner.indeterminate = YES;
+    spinner.usesThreadedAnimation = YES;
+    spinner.hidden = YES;
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    return spinner;
+}
+
+- (void)createDesktopFeedback {
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 480, 96)
+                                               styleMask:NSWindowStyleMaskBorderless |
+                                                         NSWindowStyleMaskNonactivatingPanel
+                                                 backing:NSBackingStoreBuffered defer:NO];
+    panel.level = NSFloatingWindowLevel;
+    panel.opaque = NO;
+    panel.backgroundColor = NSColor.clearColor;
+    panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    panel.hasShadow = YES;
+    panel.ignoresMouseEvents = YES;
+    panel.hidesOnDeactivate = NO;
+    panel.collectionBehavior = NSWindowCollectionBehaviorMoveToActiveSpace |
+                               NSWindowCollectionBehaviorFullScreenAuxiliary |
+                               NSWindowCollectionBehaviorIgnoresCycle;
+
+    NSView *background = panel.contentView;
+    background.wantsLayer = YES;
+    background.layer.backgroundColor = [NSColor colorWithWhite:0.075 alpha:0.98].CGColor;
+    background.layer.borderColor = [NSColor colorWithWhite:1 alpha:0.25].CGColor;
+    background.layer.borderWidth = 1;
+    background.layer.cornerRadius = 20;
+
+    self.feedbackLabel = [NSTextField labelWithString:@""];
+    self.feedbackLabel.font = [NSFont systemFontOfSize:28 weight:NSFontWeightBold];
+    self.feedbackLabel.textColor = NSColor.whiteColor;
+    self.feedbackSpinner = [self makeStatusSpinner];
+    self.feedbackSpinner.controlSize = NSControlSizeRegular;
+    NSStackView *status = [NSStackView stackViewWithViews:@[self.feedbackSpinner, self.feedbackLabel]];
+    status.spacing = 14;
+    status.alignment = NSLayoutAttributeCenterY;
+    status.translatesAutoresizingMaskIntoConstraints = NO;
+    [background addSubview:status];
+    [NSLayoutConstraint activateConstraints:@[
+        [status.centerXAnchor constraintEqualToAnchor:background.centerXAnchor],
+        [status.centerYAnchor constraintEqualToAnchor:background.centerYAnchor],
+        [status.widthAnchor constraintLessThanOrEqualToConstant:440],
+        [self.feedbackSpinner.widthAnchor constraintEqualToConstant:28],
+        [self.feedbackSpinner.heightAnchor constraintEqualToConstant:28]
+    ]];
+    self.feedbackPanel = panel;
+}
+
+- (void)positionDesktopFeedback:(NSNotification *)notification {
+    NSScreen *screen = NSScreen.screens.firstObject;
+    if (!screen || !self.feedbackPanel) return;
+    NSRect visible = screen.visibleFrame;
+    NSSize size = self.feedbackPanel.frame.size;
+    [self.feedbackPanel setFrameOrigin:NSMakePoint(NSMidX(visible) - size.width / 2,
+                                                   NSMaxY(visible) - size.height - 44)];
+}
+
+- (void)hideDesktopFeedback {
+    [self.feedbackDismissTimer invalidate];
+    self.feedbackDismissTimer = nil;
+    [self.feedbackSpinner stopAnimation:nil];
+    [self.feedbackPanel orderOut:nil];
+}
+
+- (void)showDesktopFeedback:(NSString *)status busy:(BOOL)busy {
+    [self hideDesktopFeedback];
+    if (!self.feedbackPanel) [self createDesktopFeedback];
+    self.feedbackLabel.stringValue = status;
+    self.feedbackPanel.accessibilityLabel = status;
+    self.feedbackSpinner.hidden = !busy;
+    if (busy) [self.feedbackSpinner startAnimation:nil];
+    [self positionDesktopFeedback:nil];
+    [self.feedbackPanel orderFrontRegardless];
+    [self.feedbackPanel displayIfNeeded];
+    if (!busy) {
+        self.feedbackDismissTimer = [NSTimer timerWithTimeInterval:2.5 repeats:NO block:^(NSTimer *timer) {
+            [self hideDesktopFeedback];
+        }];
+        [NSRunLoop.mainRunLoop addTimer:self.feedbackDismissTimer forMode:NSRunLoopCommonModes];
+    }
 }
 
 - (NSButton *)controlWithTitle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
@@ -389,24 +506,59 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
     NSUInteger generation = self.monitor.connectionGeneration;
     [self.monitor poll];
     BOOL connected = self.monitor.sessions.count > 0;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     if (connected && self.monitor.connectionGeneration != generation && !self.monitor.manuallyRestored) {
         // O+ Connect can reconfigure the display while starting the session.
-        _nextAutomaticCheck = NSProcessInfo.processInfo.systemUptime + 5;
+        _nextAutomaticCheck = now + 5;
+        _waitingForDesktop = NO;
         _automaticAttempts = 0;
         _automaticModeRequested = NO;
     } else if (!connected && wasConnected) {
         _nextAutomaticCheck = 0;
-        [self restoreMode:NO];
+        _waitingForDesktop = NO;
+        if (_originalMode && [self desktopIsReady]) {
+            [self performDisplayChangeWithStatus:@"正在恢复原分辨率…" desktopFeedback:YES change:^{
+                [self restoreMode:NO];
+            }];
+        } else {
+            [self restoreMode:NO];
+        }
     }
     if (connected && _nextAutomaticCheck && !self.monitor.manuallyRestored &&
-        NSProcessInfo.processInfo.systemUptime >= _nextAutomaticCheck) {
+        [self automaticSwitchIsDueAt:now]) {
         [self advanceAutomaticSwitch];
     }
     [self refreshStatus];
 }
 
+- (BOOL)desktopIsReady {
+    NSDictionary *session = CFBridgingRelease(CGSessionCopyCurrentDictionary());
+    if (!SessionIsUnlocked(session)) return NO;
+
+    NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    return frontmost && ![frontmost.bundleIdentifier isEqualToString:@"com.apple.loginwindow"];
+}
+
+- (BOOL)automaticSwitchIsDueAt:(NSTimeInterval)now {
+    if (![self desktopIsReady]) {
+        _waitingForDesktop = !_automaticModeRequested;
+        return NO;
+    }
+
+    return _waitingForDesktop || now >= _nextAutomaticCheck;
+}
+
+- (void)desktopApplicationDidActivate:(NSNotification *)notification {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_waitingForDesktop && self->_nextAutomaticCheck) [self poll:nil];
+    });
+}
+
 - (void)advanceAutomaticSwitch {
+    NSTimeInterval scheduledCheck = _nextAutomaticCheck;
+    NSTimeInterval startupCheck = _automaticModeRequested ? 0 : scheduledCheck;
     _nextAutomaticCheck = 0;
+    _waitingForDesktop = NO;
     if (_restorePending) return;
 
     if (_automaticModeRequested && _originalMode) {
@@ -420,14 +572,30 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
     }
 
     if (_automaticAttempts >= 2) return;
-    _automaticAttempts++;
-    _automaticModeRequested = YES;
-    [self applyRemoteModeAllowingRetry:YES];
-    _nextAutomaticCheck = NSProcessInfo.processInfo.systemUptime + 1;
+    [self performDisplayChangeWithStatus:[self switchingStatus] desktopFeedback:YES change:^{
+        // The screen can relock while AppKit presents the feedback.
+        if (![self desktopIsReady]) {
+            _waitingForDesktop = !_automaticModeRequested;
+            _nextAutomaticCheck = scheduledCheck;
+            return;
+        }
+        _automaticAttempts++;
+        _automaticModeRequested = YES;
+        [self applyRemoteModeAllowingRetry:YES];
+        // When unlock allowed an early switch, verify again after O+ Connect has settled.
+        _nextAutomaticCheck = MAX(NSProcessInfo.processInfo.systemUptime, startupCheck) + 1;
+    }];
 }
 
 - (void)refreshStatus {
     BOOL busy = self.pendingStatus != nil;
+    if (busy && self.statusSpinner.hidden) {
+        self.statusSpinner.hidden = NO;
+        [self.statusSpinner startAnimation:nil];
+    } else if (!busy && !self.statusSpinner.hidden) {
+        [self.statusSpinner stopAnimation:nil];
+        self.statusSpinner.hidden = YES;
+    }
     self.statusLabel.stringValue = self.pendingStatus ?: (self.modeStatus ?: @"当前为原分辨率");
     self.panel.accessibilityLabel = self.statusLabel.stringValue;
     self.landscapeButton.enabled = !busy && _originalMode == NULL;
@@ -437,27 +605,55 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
     self.restoreMenuItem.enabled = self.restoreButton.enabled;
 }
 
+- (NSString *)switchingStatus {
+    CGDirectDisplayID screen = _originalMode ? _screen : CGMainDisplayID();
+    CGDisplayModeRef original = _originalMode ?: CGDisplayCopyDisplayMode(screen);
+    CGDisplayModeRef target = original ? CopyRemoteMode(screen, original) : NULL;
+    if (original && !_originalMode) CGDisplayModeRelease(original);
+    if (!target) return @"正在切换到手机友好分辨率…";
+
+    NSString *status = [NSString stringWithFormat:@"正在切换到 %zu × %zu…",
+                        CGDisplayModeGetWidth(target), CGDisplayModeGetHeight(target)];
+    CGDisplayModeRelease(target);
+    return status;
+}
+
+- (void)performDisplayChangeWithStatus:(NSString *)status
+                       desktopFeedback:(BOOL)desktopFeedback
+                                 change:(void (^)(void))change {
+    self.pendingStatus = status;
+    [self refreshStatus];
+    [self.panel displayIfNeeded];
+    if (desktopFeedback) [self showDesktopFeedback:status busy:YES];
+
+    // Let AppKit present the status before the synchronous system display transaction.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        change();
+        // WindowServer can temporarily omit the host after changing display mode.
+        if (self.panel.isVisible) _lastVisibleWindow = NSProcessInfo.processInfo.systemUptime;
+        self.pendingStatus = nil;
+        [self refreshStatus];
+        if (desktopFeedback && [self desktopIsReady] && self.modeStatus) {
+            [self showDesktopFeedback:self.modeStatus busy:NO];
+        } else if (desktopFeedback) {
+            [self hideDesktopFeedback];
+        }
+    });
+}
+
 - (void)performManualChangeRestoring:(BOOL)restoring {
     if (self.pendingStatus || restoring != (_originalMode != NULL)) return;
 
     _nextAutomaticCheck = 0;
-    self.pendingStatus = restoring ? @"正在恢复原分辨率…" : @"正在切换到手机友好模式…";
-    [self refreshStatus];
-    [self.panel displayIfNeeded];
-
-    // Present the feedback before the synchronous system display transaction.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    NSString *status = restoring ? @"正在恢复原分辨率…" : [self switchingStatus];
+    [self performDisplayChangeWithStatus:status desktopFeedback:!self.panel.isVisible change:^{
         self.monitor.manuallyRestored = restoring && self.monitor.sessions.count > 0;
         if (restoring) {
             [self restoreMode:YES];
         } else {
             [self applyRemoteMode];
         }
-        // WindowServer can temporarily omit the host after changing display mode.
-        if (self.panel.isVisible) _lastVisibleWindow = NSProcessInfo.processInfo.systemUptime;
-        self.pendingStatus = nil;
-        [self refreshStatus];
-    });
+    }];
 }
 
 - (void)applyManually:(id)sender {
@@ -540,11 +736,16 @@ static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self
+                                                               name:NSWorkspaceDidActivateApplicationNotification
+                                                             object:nil];
+    [NSNotificationCenter.defaultCenter removeObserver:self];
     [self.timer invalidate];
     self.timer = nil;
     [self.windowTimer invalidate];
     self.windowTimer = nil;
     [self.panel orderOut:nil];
+    [self hideDesktopFeedback];
     [self restoreMode:NO];
 }
 @end
