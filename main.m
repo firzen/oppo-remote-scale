@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ColorSync/ColorSync.h>
 #import <IOKit/graphics/IOGraphicsTypes.h>
 #import <libproc.h>
 #import <sys/stat.h>
@@ -212,35 +213,79 @@ static CGDisplayModeRef CopyFactoryRestoreMode(CGDirectDisplayID screen, CGDispl
     return best ? CGDisplayModeRetain(best) : NULL;
 }
 
-static CGDisplayModeRef CopyRemoteMode(CGDirectDisplayID screen, CGDisplayModeRef current) {
+static NSArray *RemoteDisplayModes(CGDirectDisplayID screen) {
+    NSDictionary *options = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
+    return CFBridgingRelease(CGDisplayCopyAllDisplayModes(screen, (__bridge CFDictionaryRef)options));
+}
+
+static CGDisplayModeRef CopyRemoteMode(CGDisplayModeRef current, NSArray *modes) {
     if (IsPreferredRemoteMode(current)) return NULL;
 
     size_t width = CGDisplayModeGetWidth(current);
     size_t height = CGDisplayModeGetHeight(current);
     double refresh = CGDisplayModeGetRefreshRate(current);
-    NSDictionary *options = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
-    NSArray *modes = CFBridgingRelease(CGDisplayCopyAllDisplayModes(screen, (__bridge CFDictionaryRef)options));
     CGDisplayModeRef best = NULL;
     double bestScore = INFINITY;
+    NSUInteger bestTier = NSUIntegerMax;
     for (id object in modes) {
         CGDisplayModeRef mode = (__bridge CGDisplayModeRef)object;
         size_t w = CGDisplayModeGetWidth(mode);
         size_t h = CGDisplayModeGetHeight(mode);
-        if (w >= width || h >= height || w < 800 || h < 600 ||
-            fabs((double)w / h - (double)width / height) > 0.02 ||
+        BOOL portrait = height > width;
+        if (w > width || h > height || (w == width && h == height) ||
+            w < (portrait ? 600 : 800) || h < (portrait ? 800 : 600) ||
             !CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
 
-        double score = fabs((double)w - preferredRemoteWidth) * 100 + fabs(CGDisplayModeGetRefreshRate(mode) - refresh);
-        // Prefer the standard pixel mode at the target size for remote capture.
+        double aspectDifference = fabs(((double)w / h) / ((double)width / height) - 1);
+        if (aspectDifference > 0.10) continue;
+        double targetWidth = portrait ? preferredRemoteWidth * (double)width / height : preferredRemoteWidth;
+        double distance = fabs((double)w - targetWidth);
+        NSUInteger tier = aspectDifference <= 0.015 ? (distance <= targetWidth * 0.05 ? 0 : 1) : 2;
+        double score = distance + fabs(CGDisplayModeGetRefreshRate(mode) - refresh);
+        if (tier == 2) score += aspectDifference * targetWidth;
         BOOL hiDPI = CGDisplayModeGetPixelWidth(mode) > w;
-        if (IsPreferredRemoteMode(mode) ? hiDPI : !hiDPI) score += 50;
-        if (score < bestScore) {
+        if (IsPreferredRemoteMode(mode) ? hiDPI : !hiDPI) score += 0.5;
+        if (tier < bestTier || (tier == bestTier && score < bestScore)) {
+            bestTier = tier;
             best = mode;
             bestScore = score;
         }
     }
     return best ? CGDisplayModeRetain(best) : NULL;
 }
+
+static NSString *DisplayUUID(CGDirectDisplayID screen) {
+    if (screen == kCGNullDirectDisplay) return nil;
+    CFUUIDRef uuid = CGDisplayCreateUUIDFromDisplayID(screen);
+    if (!uuid) return nil;
+    NSString *key = CFBridgingRelease(CFUUIDCreateString(NULL, uuid));
+    CFRelease(uuid);
+    return key;
+}
+
+static CGDirectDisplayID OnlineDisplayForUUID(NSString *key) {
+    CFUUIDRef uuid = CFUUIDCreateFromString(NULL, (__bridge CFStringRef)key);
+    if (!uuid) return kCGNullDirectDisplay;
+    CGDirectDisplayID screen = CGDisplayGetDisplayIDFromUUID(uuid);
+    CFRelease(uuid);
+    return screen && CGDisplayIsOnline(screen) && [DisplayUUID(screen) isEqualToString:key]
+        ? screen : kCGNullDirectDisplay;
+}
+
+@interface DisplayRestoreState : NSObject
+@property (assign) CGDisplayModeRef originalMode;
+@property (assign) CGDisplayModeRef remoteMode;
+@property BOOL restorePending;
+@property BOOL manualRestoreRequired;
+@property BOOL restoreOnReconnect;
+@end
+
+@implementation DisplayRestoreState
+- (void)dealloc {
+    if (_originalMode) CGDisplayModeRelease(_originalMode);
+    if (_remoteMode) CGDisplayModeRelease(_remoteMode);
+}
+@end
 
 static NSString *DisplayModeStatus(CGDisplayModeRef mode) {
     return [NSString stringWithFormat:@"当前分辨率 %zu × %zu",
@@ -277,11 +322,8 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 @end
 
 @implementation MenuController {
-    CGDirectDisplayID _screen;
-    CGDisplayModeRef _originalMode;
-    CGDisplayModeRef _remoteMode;
-    BOOL _restorePending;
-    BOOL _manualRestoreRequired;
+    NSMutableDictionary<NSString *, DisplayRestoreState *> *_displayStates;
+    NSString *_observedMainDisplay;
     BOOL _observedConnection;
     NSUInteger _observedConnectionGeneration;
     NSTimeInterval _nextAutomaticCheck;
@@ -292,6 +334,8 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    _displayStates = [NSMutableDictionary dictionary];
+    _observedMainDisplay = DisplayUUID(CGMainDisplayID());
     self.monitor = [SessionMonitor new];
     [self createControls];
     [self createStatusMenu];
@@ -602,9 +646,15 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     _observedConnection = connected;
     _observedConnectionGeneration = generation;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    if (newConnection && !self.monitor.manuallyRestored) {
+    NSString *mainDisplay = DisplayUUID(CGMainDisplayID());
+    BOOL mainChanged = ![_observedMainDisplay isEqualToString:mainDisplay];
+    if (mainChanged) {
+        _observedMainDisplay = mainDisplay;
+        self.modeStatus = nil;
+    }
+    if ((newConnection || (connected && mainChanged)) && !self.monitor.manuallyRestored) {
         // O+ Connect can reconfigure the display while starting the session.
-        _nextAutomaticCheck = now + 5;
+        _nextAutomaticCheck = now + (newConnection ? 5 : 1);
         _waitingForDesktop = NO;
         _automaticAttempts = 0;
         _automaticModeRequested = NO;
@@ -612,13 +662,20 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
         _nextAutomaticCheck = 0;
         _waitingForDesktop = NO;
         [self prepareFactoryRestoreMode];
-        if (_originalMode && [self desktopIsReady]) {
+        if (_displayStates.count && [self desktopIsReady]) {
             [self performDisplayChangeWithStatus:@"正在恢复原分辨率…" desktopFeedback:YES change:^BOOL{
-                [self restoreMode:NO];
+                [self restoreAllDisplays];
                 return YES;
             }];
         } else {
-            [self restoreMode:NO];
+            [self restoreAllDisplays];
+        }
+    }
+    if (!self.pendingStatus && [self desktopIsReady]) {
+        for (NSString *key in _displayStates.allKeys) {
+            if (_displayStates[key].restoreOnReconnect && OnlineDisplayForUUID(key)) {
+                [self restoreDisplay:key manual:NO];
+            }
         }
     }
     if (connected && _nextAutomaticCheck && !self.monitor.manuallyRestored &&
@@ -656,12 +713,14 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     NSTimeInterval startupCheck = _automaticModeRequested ? 0 : scheduledCheck;
     _nextAutomaticCheck = 0;
     _waitingForDesktop = NO;
-    if (_restorePending || _manualRestoreRequired) return;
+    NSString *key = DisplayUUID(CGMainDisplayID());
+    DisplayRestoreState *state = key ? _displayStates[key] : nil;
+    if (state.restorePending || state.manualRestoreRequired || state.restoreOnReconnect) return;
 
-    if (_automaticModeRequested && _originalMode) {
-        CGDisplayModeRef current = CGDisplayCopyDisplayMode(_screen);
+    if (state) {
+        CGDisplayModeRef current = CGDisplayCopyDisplayMode(CGMainDisplayID());
         if (current) {
-            BOOL bouncedBack = CFEqual(current, _originalMode);
+            BOOL bouncedBack = CFEqual(current, state.originalMode);
             self.modeStatus = DisplayModeStatus(current);
             CGDisplayModeRelease(current);
             if (!bouncedBack) return;
@@ -675,7 +734,8 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     NSUInteger generation = self.monitor.connectionGeneration;
     [self performDisplayChangeWithStatus:status desktopFeedback:YES change:^BOOL{
         [self.monitor poll];
-        if (!self.monitor.sessions.count || self.monitor.connectionGeneration != generation) return NO;
+        if (!self.monitor.sessions.count || self.monitor.connectionGeneration != generation ||
+            ![key isEqualToString:DisplayUUID(CGMainDisplayID())]) return NO;
 
         // The screen can relock while AppKit presents the feedback.
         if (![self desktopIsReady]) {
@@ -694,15 +754,17 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 
 - (void)refreshStatus {
     BOOL busy = self.pendingStatus != nil;
-    CGDirectDisplayID screen = _originalMode ? _screen : CGMainDisplayID();
+    CGDirectDisplayID screen = CGMainDisplayID();
+    NSString *key = DisplayUUID(screen);
+    DisplayRestoreState *state = key ? _displayStates[key] : nil;
     CGDisplayModeRef current = CGDisplayCopyDisplayMode(screen);
     BOOL remoteSelected = IsPreferredRemoteMode(current) ||
-                          (current && _remoteMode && CFEqual(current, _remoteMode));
+                          (current && state.remoteMode && CFEqual(current, state.remoteMode));
     NSControlStateValue remoteState = remoteSelected ? NSControlStateValueOn : NSControlStateValueOff;
     NSString *status = self.modeStatus;
-    if (current && (!status || (remoteSelected && !_originalMode))) status = DisplayModeStatus(current);
-    CGDisplayModeRef defaultMode = !busy && !_originalMode ? CopyFactoryRestoreMode(screen, current) : NULL;
-    BOOL canRestore = _originalMode || defaultMode;
+    if (current && (!status || (remoteSelected && !state.originalMode))) status = DisplayModeStatus(current);
+    CGDisplayModeRef defaultMode = !busy && !state.originalMode ? CopyFactoryRestoreMode(screen, current) : NULL;
+    BOOL canRestore = state.originalMode || defaultMode;
     if (defaultMode) CGDisplayModeRelease(defaultMode);
     if (current) CGDisplayModeRelease(current);
 
@@ -716,7 +778,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     self.statusLabel.stringValue = self.pendingStatus ?: (status ?: @"无法读取当前分辨率");
     self.panel.accessibilityLabel = self.statusLabel.stringValue;
     self.landscapeButton.state = remoteState;
-    self.landscapeButton.enabled = !busy && (remoteSelected || _originalMode == NULL);
+    self.landscapeButton.enabled = !busy && (remoteSelected || state.originalMode == NULL);
     self.restoreButton.enabled = !busy && canRestore;
     self.statusMenuLabel.title = self.statusLabel.stringValue;
     self.landscapeMenuItem.state = remoteState;
@@ -725,15 +787,17 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 - (NSString *)switchingStatus {
-    CGDirectDisplayID screen = _originalMode ? _screen : CGMainDisplayID();
-    CGDisplayModeRef original = _originalMode
-        ? CGDisplayModeRetain(_originalMode) : CGDisplayCopyDisplayMode(screen);
+    CGDirectDisplayID screen = CGMainDisplayID();
+    NSString *key = DisplayUUID(screen);
+    DisplayRestoreState *state = key ? _displayStates[key] : nil;
+    CGDisplayModeRef original = state.originalMode
+        ? CGDisplayModeRetain(state.originalMode) : CGDisplayCopyDisplayMode(screen);
     if (IsPreferredRemoteMode(original)) {
         self.modeStatus = DisplayModeStatus(original);
         CGDisplayModeRelease(original);
         return nil;
     }
-    CGDisplayModeRef target = original ? CopyRemoteMode(screen, original) : NULL;
+    CGDisplayModeRef target = original ? CopyRemoteMode(original, RemoteDisplayModes(screen)) : NULL;
     if (original) CGDisplayModeRelease(original);
     if (!target) return @"正在切换到手机友好分辨率…";
 
@@ -767,9 +831,9 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 - (void)prepareFactoryRestoreMode {
-    if (_originalMode) return;
-
     CGDirectDisplayID screen = CGMainDisplayID();
+    NSString *key = DisplayUUID(screen);
+    if (!key || _displayStates[key]) return;
     CGDisplayModeRef current = CGDisplayCopyDisplayMode(screen);
     CGDisplayModeRef fallback = CopyFactoryRestoreMode(screen, current);
     if (!fallback) {
@@ -777,16 +841,18 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
         return;
     }
 
-    _screen = screen;
-    _originalMode = fallback;
-    _remoteMode = current;
+    DisplayRestoreState *state = [DisplayRestoreState new];
+    state.originalMode = fallback;
+    state.remoteMode = current;
+    _displayStates[key] = state;
 }
 
 - (void)performManualChangeRestoring:(BOOL)restoring {
-    if (self.pendingStatus || (!restoring && _originalMode)) return;
+    NSString *key = DisplayUUID(CGMainDisplayID());
+    if (!key || self.pendingStatus || (!restoring && _displayStates[key])) return;
     if (restoring) {
         [self prepareFactoryRestoreMode];
-        if (!_originalMode) {
+        if (!_displayStates[key]) {
             [self refreshStatus];
             return;
         }
@@ -799,9 +865,10 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
         return;
     }
     [self performDisplayChangeWithStatus:status desktopFeedback:!self.panel.isVisible change:^BOOL{
+        if (!restoring && ![key isEqualToString:DisplayUUID(CGMainDisplayID())]) return NO;
         self.monitor.manuallyRestored = restoring && self.monitor.sessions.count > 0;
         if (restoring) {
-            [self restoreMode:YES];
+            [self restoreDisplay:key manual:YES];
         } else {
             [self applyRemoteMode];
         }
@@ -810,10 +877,6 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 - (void)applyManually:(id)sender {
-    if (_originalMode) {
-        [self refreshStatus];
-        return;
-    }
     [self performManualChangeRestoring:NO];
 }
 
@@ -822,10 +885,13 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 - (void)applyRemoteModeAllowingRetry:(BOOL)retry {
-    if (_originalMode && !retry) return;
-    CGDirectDisplayID screen = _originalMode ? _screen : CGMainDisplayID();
-    CGDisplayModeRef original = _originalMode
-        ? CGDisplayModeRetain(_originalMode) : CGDisplayCopyDisplayMode(screen);
+    CGDirectDisplayID screen = CGMainDisplayID();
+    NSString *key = DisplayUUID(screen);
+    DisplayRestoreState *state = key ? _displayStates[key] : nil;
+    if (!key || (state && !retry)) return;
+    if (!_displayStates) _displayStates = [NSMutableDictionary dictionary];
+    CGDisplayModeRef original = state ? CGDisplayModeRetain(state.originalMode)
+                                      : CGDisplayCopyDisplayMode(screen);
     if (!original) {
         self.modeStatus = @"无法读取当前显示模式";
         return;
@@ -835,70 +901,87 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
         CGDisplayModeRelease(original);
         return;
     }
-    CGDisplayModeRef remote = CopyRemoteMode(screen, original);
-    if (!remote || CGDisplaySetDisplayMode(screen, remote, NULL) != kCGErrorSuccess) {
-        if (remote) CGDisplayModeRelease(remote);
+    NSMutableArray *modes = [RemoteDisplayModes(screen) mutableCopy];
+    CGDisplayModeRef remote;
+    while ((remote = CopyRemoteMode(original, modes))) {
+        if (CGDisplaySetDisplayMode(screen, remote, NULL) == kCGErrorSuccess) {
+            CGDisplayModeRef applied = CGDisplayCopyDisplayMode(screen);
+            if (applied && CGDisplayModeGetWidth(applied) == CGDisplayModeGetWidth(remote) &&
+                CGDisplayModeGetHeight(applied) == CGDisplayModeGetHeight(remote)) {
+                CGDisplayModeRelease(remote);
+                remote = applied;
+                break;
+            }
+            if (applied) CGDisplayModeRelease(applied);
+        }
+        // Core Graphics can reject one mode and accept another at the same size.
+        NSUInteger index = [modes indexOfObjectIdenticalTo:(__bridge id)remote];
+        [modes removeObjectAtIndex:index];
+        CGDisplayModeRelease(remote);
+    }
+    if (!remote) {
         CGDisplayModeRelease(original);
         self.modeStatus = @"当前显示器无法切换到远控分辨率";
         return;
     }
-    if (_originalMode) CGDisplayModeRelease(_originalMode);
-    if (_remoteMode) CGDisplayModeRelease(_remoteMode);
-    _screen = screen;
-    _originalMode = original;
-    _remoteMode = remote;
+    DisplayRestoreState *updated = [DisplayRestoreState new];
+    updated.originalMode = original;
+    updated.remoteMode = remote;
+    _displayStates[key] = updated;
 
-    CGDisplayModeRef applied = CGDisplayCopyDisplayMode(screen);
-    self.modeStatus = applied ? DisplayModeStatus(applied) : @"已请求切换，实际分辨率暂不可读";
-    if (applied) CGDisplayModeRelease(applied);
+    self.modeStatus = DisplayModeStatus(remote);
 }
 
-- (void)restoreMode:(BOOL)manual {
-    if (!_originalMode) return;
-    if (!CGDisplayIsOnline(_screen)) {
-        self.modeStatus = @"显示器暂不可用，可重试恢复";
+- (void)restoreAllDisplays {
+    for (NSString *key in _displayStates.allKeys) {
+        [self restoreDisplay:key manual:NO];
+    }
+}
+
+- (void)restoreDisplay:(NSString *)key manual:(BOOL)manual {
+    DisplayRestoreState *state = _displayStates[key];
+    if (!state) return;
+    CGDirectDisplayID screen = OnlineDisplayForUUID(key);
+    if (!screen) {
+        state.restoreOnReconnect = YES;
         return;
     }
-    CGDisplayModeRef current = CGDisplayCopyDisplayMode(_screen);
+    BOOL isMain = screen == CGMainDisplayID();
+    state.restoreOnReconnect = NO;
+    CGDisplayModeRef current = CGDisplayCopyDisplayMode(screen);
     if (!current) {
-        self.modeStatus = @"无法读取分辨率，可重试恢复";
+        if (isMain) self.modeStatus = @"无法读取分辨率，可重试恢复";
         return;
     }
 
-    BOOL alreadyRestored = CFEqual(current, _originalMode);
-    BOOL shouldRestore = manual || _restorePending || !_remoteMode || CFEqual(current, _remoteMode);
+    BOOL alreadyRestored = CFEqual(current, state.originalMode);
+    BOOL shouldRestore = manual || state.restorePending || !state.remoteMode || CFEqual(current, state.remoteMode);
     if (!alreadyRestored && !shouldRestore) {
-        _manualRestoreRequired = YES;
-        self.modeStatus = [DisplayModeStatus(current) stringByAppendingString:@"，可手动恢复"];
+        state.manualRestoreRequired = YES;
+        if (isMain) self.modeStatus = [DisplayModeStatus(current) stringByAppendingString:@"，可手动恢复"];
         CGDisplayModeRelease(current);
         return;
     }
 
     if (!alreadyRestored) {
         CGDisplayModeRelease(current);
-        _restorePending = YES;
-        if (CGDisplaySetDisplayMode(_screen, _originalMode, NULL) != kCGErrorSuccess) {
-            self.modeStatus = @"恢复失败，可重试";
+        state.restorePending = YES;
+        if (CGDisplaySetDisplayMode(screen, state.originalMode, NULL) != kCGErrorSuccess) {
+            if (isMain) self.modeStatus = @"恢复失败，可重试";
             return;
         }
 
-        current = CGDisplayCopyDisplayMode(_screen);
-        if (!current || !CFEqual(current, _originalMode)) {
+        current = CGDisplayCopyDisplayMode(screen);
+        if (!current || !CFEqual(current, state.originalMode)) {
             if (current) CGDisplayModeRelease(current);
-            self.modeStatus = @"尚未确认恢复，可重试";
+            if (isMain) self.modeStatus = @"尚未确认恢复，可重试";
             return;
         }
     }
 
-    self.modeStatus = DisplayModeStatus(current);
+    if (isMain) self.modeStatus = DisplayModeStatus(current);
     CGDisplayModeRelease(current);
-    CGDisplayModeRelease(_originalMode);
-    if (_remoteMode) CGDisplayModeRelease(_remoteMode);
-    _originalMode = NULL;
-    _remoteMode = NULL;
-    _restorePending = NO;
-    _manualRestoreRequired = NO;
-    _screen = kCGNullDirectDisplay;
+    [_displayStates removeObjectForKey:key];
 }
 
 - (void)restoreManually:(id)sender {
@@ -916,7 +999,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     self.windowTimer = nil;
     [self.panel orderOut:nil];
     [self hideDesktopFeedback];
-    [self restoreMode:NO];
+    [self restoreAllDisplays];
 }
 @end
 
