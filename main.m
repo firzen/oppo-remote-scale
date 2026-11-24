@@ -8,6 +8,7 @@
 static NSString *const daemonSuffix = @"/O+Connect.app/Contents/Resources/daemon/oplus_remote_service";
 static const size_t preferredRemoteWidth = 1152;
 static const size_t preferredRemoteHeight = 720;
+static const NSTimeInterval reconnectGrace = 3.0;
 
 static BOOL IsRemoteDaemon(NSNumber *pid) {
     char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
@@ -43,6 +44,12 @@ static BOOL IsRemoteDaemon(NSNumber *pid) {
 @property (strong) NSMutableDictionary<NSString *, SessionLogCursor *> *cursors;
 @property BOOL manuallyRestored;
 @property NSUInteger connectionGeneration;
+@property NSUInteger readableLogs;
+@property NSUInteger connectionEvents;
+@property NSUInteger idleEvents;
+@property NSUInteger unparsedEvents;
+@property (copy) NSString *lastEventTimestamp;
+@property (copy) NSString *lastEventState;
 - (void)poll;
 @end
 
@@ -78,6 +85,8 @@ static BOOL IsRemoteDaemon(NSNumber *pid) {
     }
     NSTextCheckingResult *match = [self.pattern firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
     if (!match) {
+        if ([line hasSuffix:@"to state:Connected"] || [line hasSuffix:@"to state:Idle"])
+            self.unparsedEvents++;
         return;
     }
 
@@ -85,6 +94,13 @@ static BOOL IsRemoteDaemon(NSNumber *pid) {
     NSString *pidText = [line substringWithRange:[match rangeAtIndex:2]];
     NSString *device = [line substringWithRange:[match rangeAtIndex:3]];
     NSString *state = [line substringWithRange:[match rangeAtIndex:4]];
+    BOOL connected = [state isEqualToString:@"Connected"];
+    if (connected) self.connectionEvents++;
+    else self.idleEvents++;
+    if (!self.lastEventTimestamp || [timestamp compare:self.lastEventTimestamp] != NSOrderedAscending) {
+        self.lastEventTimestamp = timestamp;
+        self.lastEventState = state;
+    }
     NSString *key = [NSString stringWithFormat:@"%@/%@", pidText, device];
     NSNumber *pid = @(pidText.intValue);
     // A previous day's log can still receive events after the new file opens.
@@ -100,19 +116,15 @@ static BOOL IsRemoteDaemon(NSNumber *pid) {
     }
     cursor.lastTimestamps[key] = timestamp;
 
-    if ([state isEqualToString:@"Connected"]) {
+    if (connected) {
         if (IsRemoteDaemon(pid)) {
             if (self.sessions.count == 0) {
                 self.connectionGeneration++;
-
             }
             self.sessions[key] = pid;
         }
     } else {
         [self.sessions removeObjectForKey:key];
-        if (self.sessions.count == 0) {
-            self.manuallyRestored = NO;
-        }
     }
 }
 
@@ -162,9 +174,7 @@ static BOOL IsRemoteDaemon(NSNumber *pid) {
             [self.sessions removeObjectForKey:key];
         }
     }
-    if (self.sessions.count == 0) {
-        self.manuallyRestored = NO;
-    }
+    self.readableLogs = 0;
 
     NSDate *now = NSDate.date;
     NSDate *yesterday = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay value:-1 toDate:now options:0];
@@ -175,6 +185,7 @@ static BOOL IsRemoteDaemon(NSNumber *pid) {
     for (NSString *path in paths) {
         NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
         if (!handle) continue;
+        self.readableLogs++;
 
         SessionLogCursor *cursor = self.cursors[path];
         if (!cursor) {
@@ -216,6 +227,64 @@ static CGDisplayModeRef CopyFactoryRestoreMode(CGDirectDisplayID screen, CGDispl
 static NSArray *RemoteDisplayModes(CGDirectDisplayID screen) {
     NSDictionary *options = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
     return CFBridgingRelease(CGDisplayCopyAllDisplayModes(screen, (__bridge CFDictionaryRef)options));
+}
+
+static NSDictionary *ModeRecord(CGDisplayModeRef mode) {
+    if (!mode) return nil;
+    return @{@"width": @(CGDisplayModeGetWidth(mode)), @"height": @(CGDisplayModeGetHeight(mode)),
+             @"pixelWidth": @(CGDisplayModeGetPixelWidth(mode)), @"pixelHeight": @(CGDisplayModeGetPixelHeight(mode)),
+             @"refreshRate": @(CGDisplayModeGetRefreshRate(mode)), @"modeID": @(CGDisplayModeGetIODisplayModeID(mode))};
+}
+
+static BOOL ModeMatchesRecord(CGDisplayModeRef mode, NSDictionary *record) {
+    return mode && [record isKindOfClass:NSDictionary.class] &&
+           [record[@"width"] isEqual:@(CGDisplayModeGetWidth(mode))] &&
+           [record[@"height"] isEqual:@(CGDisplayModeGetHeight(mode))] &&
+           [record[@"pixelWidth"] isEqual:@(CGDisplayModeGetPixelWidth(mode))] &&
+           [record[@"pixelHeight"] isEqual:@(CGDisplayModeGetPixelHeight(mode))] &&
+           [record[@"refreshRate"] isEqual:@(CGDisplayModeGetRefreshRate(mode))];
+}
+
+static NSArray *RecordedModes(CGDirectDisplayID screen, NSDictionary *record) {
+    NSMutableArray *matching = [NSMutableArray array];
+    NSMutableArray *other = [NSMutableArray array];
+    for (id object in RemoteDisplayModes(screen)) {
+        CGDisplayModeRef mode = (__bridge CGDisplayModeRef)object;
+        if (!ModeMatchesRecord(mode, record)) continue;
+        if ([record[@"modeID"] isEqual:@(CGDisplayModeGetIODisplayModeID(mode))]) {
+            [matching insertObject:object atIndex:0];
+        } else if (CGDisplayModeIsUsableForDesktopGUI(mode)) {
+            [matching addObject:object];
+        } else {
+            [other addObject:object];
+        }
+    }
+    [matching addObjectsFromArray:other];
+    return matching;
+}
+
+static CGError RestoreModeForSession(CGDirectDisplayID screen, CGDisplayModeRef mode) {
+    CGDisplayConfigRef configuration = NULL;
+    CGError result = CGBeginDisplayConfiguration(&configuration);
+    if (result != kCGErrorSuccess) return result;
+    result = CGConfigureDisplayWithDisplayMode(configuration, screen, mode, NULL);
+    if (result != kCGErrorSuccess) {
+        CGCancelDisplayConfiguration(configuration);
+        return result;
+    }
+    return CGCompleteDisplayConfiguration(configuration, kCGConfigureForSession);
+}
+
+static NSURL *RestoreJournalURL(void) {
+    return [NSURL fileURLWithPath:[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Library/Application Support/local.oppo.remote-optimize/display-restore.plist"]];
+}
+
+static void LogMode(NSString *event, CGDisplayModeRef mode) {
+    NSLog(@"RemoteScale %@ macOS=%zux%zu pixels=%zux%zu Hz=%.2f", event,
+          CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode),
+          CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode),
+          CGDisplayModeGetRefreshRate(mode));
 }
 
 static CGDisplayModeRef CopyRemoteMode(CGDisplayModeRef current, NSArray *modes) {
@@ -274,16 +343,18 @@ static CGDirectDisplayID OnlineDisplayForUUID(NSString *key) {
 
 @interface DisplayRestoreState : NSObject
 @property (assign) CGDisplayModeRef originalMode;
-@property (assign) CGDisplayModeRef remoteMode;
+@property (copy) NSDictionary *originalRecord;
+@property (copy) NSDictionary *remoteRecord;
 @property BOOL restorePending;
 @property BOOL manualRestoreRequired;
 @property BOOL restoreOnReconnect;
+@property NSUInteger restoreAttempts;
+@property NSTimeInterval retryRestoreAt;
 @end
 
 @implementation DisplayRestoreState
 - (void)dealloc {
     if (_originalMode) CGDisplayModeRelease(_originalMode);
-    if (_remoteMode) CGDisplayModeRelease(_remoteMode);
 }
 @end
 
@@ -325,7 +396,9 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     NSMutableDictionary<NSString *, DisplayRestoreState *> *_displayStates;
     NSString *_observedMainDisplay;
     BOOL _observedConnection;
-    NSUInteger _observedConnectionGeneration;
+    NSTimeInterval _disconnectDeadline;
+    BOOL _recoveringAfterLaunch;
+    NSMutableDictionary<NSString *, NSDictionary *> *_journal;
     NSTimeInterval _nextAutomaticCheck;
     BOOL _waitingForDesktop;
     NSUInteger _automaticAttempts;
@@ -335,6 +408,19 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     _displayStates = [NSMutableDictionary dictionary];
+    _journal = [[NSDictionary dictionaryWithContentsOfURL:RestoreJournalURL() error:NULL] mutableCopy]
+               ?: [NSMutableDictionary dictionary];
+    for (NSString *key in _journal) {
+        NSDictionary *entry = _journal[key];
+        if (![entry isKindOfClass:NSDictionary.class] ||
+            ![entry[@"original"] isKindOfClass:NSDictionary.class] ||
+            ![entry[@"remote"] isKindOfClass:NSDictionary.class]) continue;
+        DisplayRestoreState *state = [DisplayRestoreState new];
+        state.originalRecord = entry[@"original"];
+        state.remoteRecord = entry[@"remote"];
+        _displayStates[key] = state;
+    }
+    _recoveringAfterLaunch = _displayStates.count > 0;
     _observedMainDisplay = DisplayUUID(CGMainDisplayID());
     self.monitor = [SessionMonitor new];
     [self createControls];
@@ -347,7 +433,8 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     // Leave an already-connected remote session alone when replacing the helper.
     [self.monitor poll];
     _observedConnection = self.monitor.sessions.count > 0;
-    _observedConnectionGeneration = self.monitor.connectionGeneration;
+    if (_recoveringAfterLaunch && !_observedConnection)
+        _disconnectDeadline = NSProcessInfo.processInfo.systemUptime + reconnectGrace;
     self.timer = [NSTimer timerWithTimeInterval:1 target:self selector:@selector(poll:) userInfo:nil repeats:YES];
     [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self
@@ -639,13 +726,22 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     if (self.pendingStatus) return;
     [self.monitor poll];
     BOOL connected = self.monitor.sessions.count > 0;
-    NSUInteger generation = self.monitor.connectionGeneration;
-    BOOL newConnection = connected && generation != _observedConnectionGeneration;
-    BOOL disconnected = !connected && _observedConnection;
-    // The deferred switch also reads the log. Handle its observations here.
-    _observedConnection = connected;
-    _observedConnectionGeneration = generation;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    BOOL newConnection = connected && !_observedConnection;
+    if (connected) {
+        if (newConnection || _disconnectDeadline) {
+            NSLog(@"RemoteScale connection=%@ active=%lu", newConnection ? @"connected" : @"reconnected",
+                  (unsigned long)self.monitor.sessions.count);
+        }
+        _disconnectDeadline = 0;
+        _recoveringAfterLaunch = NO;
+        _observedConnection = YES;
+    } else if (_observedConnection && !_disconnectDeadline) {
+        _disconnectDeadline = now + reconnectGrace;
+        NSLog(@"RemoteScale connection=waiting-for-reconnect");
+    }
+    BOOL disconnected = _disconnectDeadline && now >= _disconnectDeadline &&
+                        (!_recoveringAfterLaunch || [self desktopIsReady]);
     NSString *mainDisplay = DisplayUUID(CGMainDisplayID());
     BOOL mainChanged = ![_observedMainDisplay isEqualToString:mainDisplay];
     if (mainChanged) {
@@ -659,11 +755,19 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
         _automaticAttempts = 0;
         _automaticModeRequested = NO;
     } else if (disconnected) {
+        BOOL recoveryOnly = _recoveringAfterLaunch;
+        _recoveringAfterLaunch = NO;
+        _observedConnection = NO;
+        _disconnectDeadline = 0;
+        self.monitor.manuallyRestored = NO;
+        NSLog(@"RemoteScale connection=%@", recoveryOnly ? @"startup-recovery" : @"disconnected");
         _nextAutomaticCheck = 0;
         _waitingForDesktop = NO;
-        [self prepareFactoryRestoreMode];
+        if (!recoveryOnly) [self prepareFactoryRestoreMode];
         if (_displayStates.count && [self desktopIsReady]) {
             [self performDisplayChangeWithStatus:@"正在恢复原分辨率…" desktopFeedback:YES change:^BOOL{
+                [self.monitor poll];
+                if (self.monitor.sessions.count) return NO;
                 [self restoreAllDisplays];
                 return YES;
             }];
@@ -671,9 +775,12 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
             [self restoreAllDisplays];
         }
     }
-    if (!self.pendingStatus && [self desktopIsReady]) {
+    if (!self.pendingStatus && !_observedConnection && !_disconnectDeadline && [self desktopIsReady]) {
         for (NSString *key in _displayStates.allKeys) {
-            if (_displayStates[key].restoreOnReconnect && OnlineDisplayForUUID(key)) {
+            DisplayRestoreState *state = _displayStates[key];
+            BOOL displayReturned = state.restoreOnReconnect && OnlineDisplayForUUID(key);
+            BOOL retryDue = state.retryRestoreAt && state.retryRestoreAt <= now;
+            if (displayReturned || retryDue) {
                 [self restoreDisplay:key manual:NO];
             }
         }
@@ -715,12 +822,13 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     _waitingForDesktop = NO;
     NSString *key = DisplayUUID(CGMainDisplayID());
     DisplayRestoreState *state = key ? _displayStates[key] : nil;
-    if (state.restorePending || state.manualRestoreRequired || state.restoreOnReconnect) return;
+    if (state.restorePending || state.manualRestoreRequired || state.restoreOnReconnect ||
+        (state && !state.originalMode)) return;
 
     if (state) {
         CGDisplayModeRef current = CGDisplayCopyDisplayMode(CGMainDisplayID());
         if (current) {
-            BOOL bouncedBack = CFEqual(current, state.originalMode);
+            BOOL bouncedBack = ModeMatchesRecord(current, state.originalRecord);
             self.modeStatus = DisplayModeStatus(current);
             CGDisplayModeRelease(current);
             if (!bouncedBack) return;
@@ -734,8 +842,11 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     NSUInteger generation = self.monitor.connectionGeneration;
     [self performDisplayChangeWithStatus:status desktopFeedback:YES change:^BOOL{
         [self.monitor poll];
-        if (!self.monitor.sessions.count || self.monitor.connectionGeneration != generation ||
-            ![key isEqualToString:DisplayUUID(CGMainDisplayID())]) return NO;
+        if (![key isEqualToString:DisplayUUID(CGMainDisplayID())]) return NO;
+        if (!self.monitor.sessions.count || self.monitor.connectionGeneration != generation) {
+            _nextAutomaticCheck = scheduledCheck;
+            return NO;
+        }
 
         // The screen can relock while AppKit presents the feedback.
         if (![self desktopIsReady]) {
@@ -758,13 +869,12 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     NSString *key = DisplayUUID(screen);
     DisplayRestoreState *state = key ? _displayStates[key] : nil;
     CGDisplayModeRef current = CGDisplayCopyDisplayMode(screen);
-    BOOL remoteSelected = IsPreferredRemoteMode(current) ||
-                          (current && state.remoteMode && CFEqual(current, state.remoteMode));
+    BOOL remoteSelected = IsPreferredRemoteMode(current) || ModeMatchesRecord(current, state.remoteRecord);
     NSControlStateValue remoteState = remoteSelected ? NSControlStateValueOn : NSControlStateValueOff;
     NSString *status = self.modeStatus;
     if (current && (!status || (remoteSelected && !state.originalMode))) status = DisplayModeStatus(current);
-    CGDisplayModeRef defaultMode = !busy && !state.originalMode ? CopyFactoryRestoreMode(screen, current) : NULL;
-    BOOL canRestore = state.originalMode || defaultMode;
+    CGDisplayModeRef defaultMode = !busy && !state ? CopyFactoryRestoreMode(screen, current) : NULL;
+    BOOL canRestore = state || defaultMode;
     if (defaultMode) CGDisplayModeRelease(defaultMode);
     if (current) CGDisplayModeRelease(current);
 
@@ -778,7 +888,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     self.statusLabel.stringValue = self.pendingStatus ?: (status ?: @"无法读取当前分辨率");
     self.panel.accessibilityLabel = self.statusLabel.stringValue;
     self.landscapeButton.state = remoteState;
-    self.landscapeButton.enabled = !busy && (remoteSelected || state.originalMode == NULL);
+    self.landscapeButton.enabled = !busy && (remoteSelected || !state);
     self.restoreButton.enabled = !busy && canRestore;
     self.statusMenuLabel.title = self.statusLabel.stringValue;
     self.landscapeMenuItem.state = remoteState;
@@ -843,7 +953,8 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 
     DisplayRestoreState *state = [DisplayRestoreState new];
     state.originalMode = fallback;
-    state.remoteMode = current;
+    state.remoteRecord = ModeRecord(current);
+    CGDisplayModeRelease(current);
     _displayStates[key] = state;
 }
 
@@ -866,8 +977,9 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     }
     [self performDisplayChangeWithStatus:status desktopFeedback:!self.panel.isVisible change:^BOOL{
         if (!restoring && ![key isEqualToString:DisplayUUID(CGMainDisplayID())]) return NO;
-        self.monitor.manuallyRestored = restoring && self.monitor.sessions.count > 0;
+        self.monitor.manuallyRestored = restoring && (_observedConnection || self.monitor.sessions.count > 0);
         if (restoring) {
+            _displayStates[key].restoreAttempts = 0;
             [self restoreDisplay:key manual:YES];
         } else {
             [self applyRemoteMode];
@@ -884,56 +996,90 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     [self applyRemoteModeAllowingRetry:NO];
 }
 
+- (BOOL)writeJournalEntry:(NSDictionary *)entry forDisplay:(NSString *)key {
+    NSMutableDictionary *updated = [_journal mutableCopy];
+    if (entry) updated[key] = entry;
+    else [updated removeObjectForKey:key];
+    if ([updated isEqualToDictionary:_journal]) return YES;
+
+    NSURL *url = RestoreJournalURL();
+    NSError *error = nil;
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:updated
+                               format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error];
+    if (!data || ![NSFileManager.defaultManager createDirectoryAtURL:url.URLByDeletingLastPathComponent
+                                withIntermediateDirectories:YES attributes:nil error:&error] ||
+        ![data writeToURL:url options:NSDataWritingAtomic error:&error]) {
+        NSLog(@"RemoteScale restore journal write failed: %@", error.localizedDescription);
+        return NO;
+    }
+    _journal = updated;
+    return YES;
+}
+
 - (void)applyRemoteModeAllowingRetry:(BOOL)retry {
     CGDirectDisplayID screen = CGMainDisplayID();
     NSString *key = DisplayUUID(screen);
     DisplayRestoreState *state = key ? _displayStates[key] : nil;
-    if (!key || (state && !retry)) return;
-    if (!_displayStates) _displayStates = [NSMutableDictionary dictionary];
-    CGDisplayModeRef original = state ? CGDisplayModeRetain(state.originalMode)
-                                      : CGDisplayCopyDisplayMode(screen);
-    if (!original) {
-        self.modeStatus = @"无法读取当前显示模式";
+    if (!key || (state && (!retry || !state.originalMode))) return;
+    if (!state) {
+        CGDisplayModeRef original = CGDisplayCopyDisplayMode(screen);
+        if (!original) {
+            self.modeStatus = @"无法读取当前显示模式";
+            return;
+        }
+        state = [DisplayRestoreState new];
+        state.originalMode = original;
+        state.originalRecord = ModeRecord(original);
+    }
+    if (IsPreferredRemoteMode(state.originalMode)) {
+        self.modeStatus = DisplayModeStatus(state.originalMode);
         return;
     }
-    if (IsPreferredRemoteMode(original)) {
-        self.modeStatus = DisplayModeStatus(original);
-        CGDisplayModeRelease(original);
-        return;
-    }
+
     NSMutableArray *modes = [RemoteDisplayModes(screen) mutableCopy];
     CGDisplayModeRef remote;
-    while ((remote = CopyRemoteMode(original, modes))) {
-        if (CGDisplaySetDisplayMode(screen, remote, NULL) == kCGErrorSuccess) {
-            CGDisplayModeRef applied = CGDisplayCopyDisplayMode(screen);
-            if (applied && CGDisplayModeGetWidth(applied) == CGDisplayModeGetWidth(remote) &&
-                CGDisplayModeGetHeight(applied) == CGDisplayModeGetHeight(remote)) {
-                CGDisplayModeRelease(remote);
-                remote = applied;
-                break;
-            }
-            if (applied) CGDisplayModeRelease(applied);
+    while ((remote = CopyRemoteMode(state.originalMode, modes))) {
+        NSDictionary *target = ModeRecord(remote);
+        if (![self writeJournalEntry:@{@"original": state.originalRecord, @"remote": target} forDisplay:key]) {
+            CGDisplayModeRelease(remote);
+            self.modeStatus = @"无法保存原分辨率，切换已取消";
+            return;
+        }
+        state.remoteRecord = target;
+        _displayStates[key] = state;
+
+        NSUInteger index = [modes indexOfObjectIdenticalTo:(__bridge id)remote];
+        LogMode(@"switch-request", remote);
+        CGError result = CGDisplaySetDisplayMode(screen, remote, NULL);
+        CGDisplayModeRelease(remote);
+        CGDisplayModeRef applied = CGDisplayCopyDisplayMode(screen);
+        if (applied) LogMode(@"switch-readback", applied);
+        if (ModeMatchesRecord(applied, target)) {
+            self.modeStatus = DisplayModeStatus(applied);
+            CGDisplayModeRelease(applied);
+            return;
+        }
+
+        BOOL atOriginal = ModeMatchesRecord(applied, state.originalRecord);
+        if (applied) CGDisplayModeRelease(applied);
+        NSLog(@"RemoteScale switch-unconfirmed error=%d original=%d", result, atOriginal);
+        if (!atOriginal) {
+            state.manualRestoreRequired = YES;
+            self.modeStatus = @"尚未确认切换，可手动恢复";
+            return;
         }
         // Core Graphics can reject one mode and accept another at the same size.
-        NSUInteger index = [modes indexOfObjectIdenticalTo:(__bridge id)remote];
         [modes removeObjectAtIndex:index];
-        CGDisplayModeRelease(remote);
     }
-    if (!remote) {
-        CGDisplayModeRelease(original);
-        self.modeStatus = @"当前显示器无法切换到远控分辨率";
-        return;
+    if (_displayStates[key] && [self writeJournalEntry:nil forDisplay:key]) {
+        [_displayStates removeObjectForKey:key];
     }
-    DisplayRestoreState *updated = [DisplayRestoreState new];
-    updated.originalMode = original;
-    updated.remoteMode = remote;
-    _displayStates[key] = updated;
-
-    self.modeStatus = DisplayModeStatus(remote);
+    self.modeStatus = @"当前显示器无法切换到远控分辨率";
 }
 
 - (void)restoreAllDisplays {
     for (NSString *key in _displayStates.allKeys) {
+        _displayStates[key].restoreAttempts = 0;
         [self restoreDisplay:key manual:NO];
     }
 }
@@ -941,6 +1087,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 - (void)restoreDisplay:(NSString *)key manual:(BOOL)manual {
     DisplayRestoreState *state = _displayStates[key];
     if (!state) return;
+    state.retryRestoreAt = 0;
     CGDirectDisplayID screen = OnlineDisplayForUUID(key);
     if (!screen) {
         state.restoreOnReconnect = YES;
@@ -948,40 +1095,53 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     }
     BOOL isMain = screen == CGMainDisplayID();
     state.restoreOnReconnect = NO;
+    NSDictionary *original = state.originalRecord ?: ModeRecord(state.originalMode);
     CGDisplayModeRef current = CGDisplayCopyDisplayMode(screen);
-    if (!current) {
-        if (isMain) self.modeStatus = @"无法读取分辨率，可重试恢复";
-        return;
-    }
-
-    BOOL alreadyRestored = CFEqual(current, state.originalMode);
-    BOOL shouldRestore = manual || state.restorePending || !state.remoteMode || CFEqual(current, state.remoteMode);
-    if (!alreadyRestored && !shouldRestore) {
+    if (current && !manual && !ModeMatchesRecord(current, original) &&
+        !ModeMatchesRecord(current, state.remoteRecord)) {
         state.manualRestoreRequired = YES;
         if (isMain) self.modeStatus = [DisplayModeStatus(current) stringByAppendingString:@"，可手动恢复"];
         CGDisplayModeRelease(current);
         return;
     }
 
-    if (!alreadyRestored) {
-        CGDisplayModeRelease(current);
+    if (current && !ModeMatchesRecord(current, original)) {
+        NSDictionary *before = ModeRecord(current);
+        NSArray *targets = RecordedModes(screen, original);
         state.restorePending = YES;
-        if (CGDisplaySetDisplayMode(screen, state.originalMode, NULL) != kCGErrorSuccess) {
-            if (isMain) self.modeStatus = @"恢复失败，可重试";
-            return;
-        }
-
-        current = CGDisplayCopyDisplayMode(screen);
-        if (!current || !CFEqual(current, state.originalMode)) {
-            if (current) CGDisplayModeRelease(current);
-            if (isMain) self.modeStatus = @"尚未确认恢复，可重试";
-            return;
+        // WindowServer can reject one mode ID or the direct switch while accepting a session transaction.
+        for (NSUInteger pass = 0; pass < 2 && ModeMatchesRecord(current, before); pass++) {
+            for (id object in targets) {
+                CGDisplayModeRef target = (__bridge CGDisplayModeRef)object;
+                LogMode(@"restore-request", target);
+                CGError result = pass == 0 ? CGDisplaySetDisplayMode(screen, target, NULL)
+                                           : RestoreModeForSession(screen, target);
+                CGDisplayModeRelease(current);
+                current = CGDisplayCopyDisplayMode(screen);
+                if (ModeMatchesRecord(current, original)) break;
+                NSLog(@"RemoteScale restore-unconfirmed error=%d modeID=%d session=%d",
+                      result, CGDisplayModeGetIODisplayModeID(target), pass != 0);
+                if (!ModeMatchesRecord(current, before)) break;
+            }
         }
     }
 
+    if (!ModeMatchesRecord(current, original)) {
+        if (current) CGDisplayModeRelease(current);
+        state.restoreAttempts++;
+        if (!manual && state.restoreAttempts < 4) {
+            state.retryRestoreAt = NSProcessInfo.processInfo.systemUptime + state.restoreAttempts;
+            if (isMain) self.modeStatus = @"尚未确认恢复，等待重试";
+        } else if (isMain) {
+            self.modeStatus = @"尚未确认恢复，可手动重试";
+        }
+        return;
+    }
+
+    LogMode(@"restore-readback", current);
     if (isMain) self.modeStatus = DisplayModeStatus(current);
     CGDisplayModeRelease(current);
-    [_displayStates removeObjectForKey:key];
+    if ([self writeJournalEntry:nil forDisplay:key]) [_displayStates removeObjectForKey:key];
 }
 
 - (void)restoreManually:(id)sender {
@@ -1003,8 +1163,64 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 @end
 
-int main(void) {
+static int RunRemoteCheck(void) {
+    SessionMonitor *monitor = [SessionMonitor new];
+    [monitor poll];
+    NSBundle *oppo = [NSBundle bundleWithPath:@"/Applications/O+Connect.app"];
+    NSString *version = [oppo objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"未知";
+    printf("O+ Connect 版本 %s\n", version.UTF8String);
+    printf("连接日志（今天及昨天）  可读文件 %lu，Connected %lu，Idle %lu，未识别候选行 %lu\n",
+           (unsigned long)monitor.readableLogs, (unsigned long)monitor.connectionEvents,
+           (unsigned long)monitor.idleEvents, (unsigned long)monitor.unparsedEvents);
+    if (monitor.lastEventState) {
+        printf("最近连接事件  %s %s\n", monitor.lastEventTimestamp.UTF8String, monitor.lastEventState.UTF8String);
+    }
+    printf("回放后仍有运行中进程的会话数  %lu\n", (unsigned long)monitor.sessions.count);
+
+    NSRegularExpression *capturePattern = [NSRegularExpression regularExpressionWithPattern:
+         @"(?m)^\\[\\d+\\]\\t(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+)\\t[^\\r\\n]*?\\t"
+          "\\[(?:MacForwardVideoStream|AVScreenCapture)\\] "
+          "(UpdateCaptureParam index \\d+ size \\d+x\\d+ scale [\\d.]+ output \\d+x\\d+|"
+          "capture session (?:start, mode \\d+|stop)\\.|size: \\d+ x \\d+)[ \\t]*\\r?$"
+        options:0 error:NULL];
+    NSDate *now = NSDate.date;
+    NSDate *yesterday = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay value:-1 toDate:now options:0];
+    NSString *since = [monitor.dateFormat stringFromDate:yesterday];
+    NSMutableArray<NSString *> *events = [NSMutableArray array];
+    NSUInteger outputEvents = 0;
+    NSArray<NSString *> *files = [NSFileManager.defaultManager contentsOfDirectoryAtPath:monitor.directory error:NULL];
+    for (NSString *file in files) {
+        if (![file isEqualToString:@"rc-daemon-sdk.log"] && ![file hasPrefix:@"rc-daemon-sdk.log."]) continue;
+        NSString *contents = [NSString stringWithContentsOfFile:[monitor.directory stringByAppendingPathComponent:file]
+                                                      encoding:NSUTF8StringEncoding error:NULL];
+        if (!contents.length) continue;
+        NSArray<NSTextCheckingResult *> *matches = [capturePattern matchesInString:contents options:0
+                                                                            range:NSMakeRange(0, contents.length)];
+        for (NSTextCheckingResult *match in matches) {
+            NSString *timestamp = [contents substringWithRange:[match rangeAtIndex:1]];
+            if ([timestamp compare:since] == NSOrderedAscending) continue;
+            NSString *event = [contents substringWithRange:[match rangeAtIndex:2]];
+            if ([event hasPrefix:@"UpdateCaptureParam"]) outputEvents++;
+            [events addObject:[NSString stringWithFormat:@"%@  %@", timestamp, event]];
+        }
+    }
+    [events sortWithOptions:NSSortStable usingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        // Keep source order when several records share the same millisecond.
+        return [[a substringToIndex:23] compare:[b substringToIndex:23] options:NSLiteralSearch];
+    }];
+    printf("SDK 抓屏日志（今天及昨天）  识别事件 %lu，其中输出参数 %lu\n",
+           (unsigned long)events.count, (unsigned long)outputEvents);
+    NSUInteger first = events.count - MIN(events.count, 40);
+    for (NSUInteger index = first; index < events.count; index++) puts(events[index].UTF8String);
+    printf("%s\n", monitor.connectionEvents && monitor.idleEvents && outputEvents
+           ? "自检：已识别连接、断开和输出参数。请用手机确认实际画面。"
+           : "自检：样本不足。请先用手机连接、切换分辨率并断开后重试。");
+    return monitor.connectionEvents && monitor.idleEvents && outputEvents ? 0 : 1;
+}
+
+int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--remote-check") == 0) return RunRemoteCheck();
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
         MenuController *controller = [MenuController new];
