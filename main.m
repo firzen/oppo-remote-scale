@@ -5,15 +5,28 @@
 #import <libproc.h>
 #import <sys/stat.h>
 
-static NSString *const daemonSuffix = @"/O+Connect.app/Contents/Resources/daemon/oplus_remote_service";
 static const size_t preferredRemoteWidth = 1152;
 static const size_t preferredRemoteHeight = 720;
 static const NSTimeInterval reconnectGrace = 3.0;
 
 static BOOL IsRemoteDaemon(NSNumber *pid) {
     char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-    return proc_pidpath(pid.intValue, path, sizeof(path)) > 0 &&
-           [@(path) hasSuffix:daemonSuffix];
+    if (proc_pidpath(pid.intValue, path, sizeof(path)) <= 0) return NO;
+    NSString *executablePath = [[NSFileManager.defaultManager
+        stringWithFileSystemRepresentation:path length:strlen(path)] stringByResolvingSymlinksInPath];
+    if (![executablePath.lastPathComponent isEqualToString:@"oplus_remote_service"]) return NO;
+
+    // Check every enclosing app: the service may itself be a nested login item.
+    // Bundle identity survives application renames, moves, and internal layout changes.
+    NSString *ancestor = executablePath.stringByDeletingLastPathComponent;
+    while (ancestor.length > 1) {
+        if ([ancestor.pathExtension isEqualToString:@"app"]) {
+            NSBundle *bundle = [NSBundle bundleWithPath:ancestor];
+            if ([bundle.bundleIdentifier isEqualToString:@"com.oplus.devicespace"]) return YES;
+        }
+        ancestor = ancestor.stringByDeletingLastPathComponent;
+    }
+    return NO;
 }
 
 @interface SessionLogCursor : NSObject
@@ -122,6 +135,8 @@ static BOOL IsRemoteDaemon(NSNumber *pid) {
                 self.connectionGeneration++;
             }
             self.sessions[key] = pid;
+        } else {
+            NSLog(@"RemoteScale daemon-validation-failed pid=%@ reason=process-unavailable-or-identity-mismatch", pid);
         }
     } else {
         [self.sessions removeObjectForKey:key];
@@ -645,7 +660,8 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 - (void)followOppoWindow:(NSTimer *)timer {
     NSRunningApplication *oppo = [NSRunningApplication
         runningApplicationsWithBundleIdentifier:@"com.oplus.devicespace"].firstObject;
-    if (!oppo || oppo.hidden) {
+    NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (!oppo || oppo.hidden || frontmost.processIdentifier != oppo.processIdentifier) {
         _lastVisibleWindow = 0;
         if (self.panel.isVisible) [self.panel orderOut:nil];
         return;
