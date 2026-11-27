@@ -54,7 +54,7 @@ struct NotesSynchronizer {
         if let error {
             let code = error[NSAppleScript.errorNumber] as? Int ?? 0
             if code == -1743 {
-                throw DingTalkError(message: "待办已读取，但未获准访问备忘录。请在系统设置 → 隐私与安全性 → 自动化中允许 OPPO 远控分辨率助手控制备忘录后重试。")
+                throw NSError(domain: NSOSStatusErrorDomain, code: code, userInfo: [NSLocalizedDescriptionKey: "请在自动化设置中允许访问备忘录。"])
             }
             throw DingTalkError(message: "待办已读取，但备忘录写入失败（\(code)）。请确认备忘录已配置可写账号后重试。")
         }

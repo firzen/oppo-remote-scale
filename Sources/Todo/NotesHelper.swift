@@ -20,7 +20,8 @@ struct NotesHelper {
             print("同步完成：\(result.synchronized) 条，新建 \(result.created)、更新 \(result.updated)、移除 \(result.removed) 篇")
         } catch {
             print(error.localizedDescription)
-            exit(1)
+            let failure = error as NSError
+            exit(failure.domain == NSOSStatusErrorDomain && failure.code == -1743 ? 77 : 1)
         }
     }
 }

@@ -5,6 +5,13 @@ import AppKit
 public final class TodoController: NSObject {
     private let client: DingTalkClient
     private var operation: Task<Void, Never>?
+    private var authorized = false
+    private let scheduleItem = NSMenuItem()
+    private let listItem = NSMenuItem()
+    private let listMenu = NSMenu()
+    private var reauthItem: NSMenuItem!
+    private var permissionItem: NSMenuItem!
+    private var stopped = false
     private var helper: Process?
     private var rotation: Timer?
     private var automaticSyncTimer: Timer?
@@ -13,7 +20,8 @@ public final class TodoController: NSObject {
     private var authorizationURL: URL?
     private weak var statusItem: NSStatusItem?
     private let stateItem = NSMenuItem(title: "尚未同步待办", action: nil, keyEquivalent: "")
-    private let titleItem = NSMenuItem(title: "暂无待办数据", action: nil, keyEquivalent: "")
+    private var hasSnapshot = false
+    private var rotationTextWidth: CGFloat = 0
     private var syncItem: NSMenuItem!
     private var authItem: NSMenuItem!
     private var cancelItem: NSMenuItem!
@@ -34,6 +42,7 @@ public final class TodoController: NSObject {
             }
         } catch { migrationError = error }
         client = DingTalkClient(storage: storage)
+        authorized = (try? storage.load()) != nil
         super.init()
         if let migrationError { stateItem.title = "授权迁移失败：" + migrationError.localizedDescription }
     }
@@ -41,26 +50,31 @@ public final class TodoController: NSObject {
     @objc(attachToMenu:statusItem:)
     public func attach(to menu: NSMenu, statusItem: NSStatusItem) {
         self.statusItem = statusItem
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "钉钉待办", action: nil, keyEquivalent: "").isEnabled = false
-        stateItem.isEnabled = false
-        titleItem.isEnabled = false
         menu.addItem(stateItem)
-        menu.addItem(titleItem)
+        menu.addItem(scheduleItem)
+        stateItem.isEnabled = false
+        scheduleItem.isEnabled = false
+        listMenu.autoenablesItems = false
+        menu.addItem(listItem)
+        listItem.submenu = listMenu
+        rebuildList()
         syncItem = add("立即同步", #selector(sync), to: menu)
         authItem = add("授权钉钉", #selector(authorize), to: menu)
         linkItem = add("重新打开授权页面", #selector(openAuthorization), to: menu)
         linkItem.isHidden = true
         cancelItem = add("取消当前操作", #selector(cancel), to: menu)
-        cancelItem.isEnabled = false
-        add("打开钉钉待办同步文件夹", #selector(openNotes), to: menu)
-        let rotationItem = add("轮播待办标题", #selector(toggleRotation(_:)), to: menu)
-        rotationItem.state = rotates ? .on : .off
-        let automaticItem = add("每半小时自动同步", #selector(toggleAutomaticSync(_:)), to: menu)
-        automaticItem.state = automaticSyncEnabled ? .on : .off
+        permissionItem = add("打开自动化设置", #selector(openAutomation), to: menu)
+        permissionItem.isHidden = true
+        let settings = NSMenu()
+        settings.autoenablesItems = false
+        menu.addItem(withTitle: "待办设置", action: nil, keyEquivalent: "").submenu = settings
+        add("轮播待办标题", #selector(toggleRotation(_:)), to: settings).state = rotates ? .on : .off
+        add("每半小时自动同步", #selector(toggleAutomaticSync(_:)), to: settings).state = automaticSyncEnabled ? .on : .off
+        add("同步到备忘录", #selector(toggleNotes(_:)), to: settings).state = notesEnabled ? .on : .off
+        reauthItem = add("重新授权", #selector(authorize), to: settings)
+        add("打开钉钉待办同步文件夹", #selector(openNotes), to: settings)
+        busy(false)
         configureAutomaticSync()
-        let notesItem = add("同步到备忘录", #selector(toggleNotes(_:)), to: menu)
-        notesItem.state = notesEnabled ? .on : .off
         rotation = Timer(timeInterval: 6, target: self, selector: #selector(rotate), userInfo: nil, repeats: true)
         RunLoop.main.add(rotation!, forMode: .common)
     }
@@ -73,14 +87,18 @@ public final class TodoController: NSObject {
     }
 
     private func busy(_ value: Bool) {
-        syncItem.isEnabled = !value
+        syncItem.isEnabled = authorized && !value
+        authItem.isHidden = authorized
+        reauthItem.isHidden = !authorized
+        reauthItem.isEnabled = !value
+        cancelItem.isHidden = !value
         authItem.isEnabled = !value
         cancelItem.isEnabled = value
     }
 
     @objc private func rotate() {
+        guard rotates else { return }
         if !titles.isEmpty {
-            titleItem.title = titles[cursor % titles.count]
             cursor = (cursor + 1) % titles.count
         }
         updateLabel()
@@ -88,11 +106,34 @@ public final class TodoController: NSObject {
 
     private func updateLabel() {
         guard let item = statusItem else { return }
-        let title = rotates && !titles.isEmpty ? String(titleItem.title.prefix(24)) : ""
-        item.length = title.isEmpty ? NSStatusItem.squareLength : NSStatusItem.variableLength
-        item.button?.title = title.isEmpty ? "" : " " + title
-        item.button?.imagePosition = .imageLeading
-        item.button?.toolTip = titles.isEmpty ? "远控分辨率 · " + stateItem.title : titleItem.title + "\n" + stateItem.title
+        guard let button = item.button else { return }
+        guard rotates, !titles.isEmpty else {
+            item.length = NSStatusItem.squareLength
+            button.title = ""
+            button.imagePosition = .imageOnly
+            button.toolTip = "远控分辨率 · " + stateItem.title
+            return
+        }
+        let full = titles[cursor]
+        var title = full
+        if textWidth(full) > rotationTextWidth {
+            title = ""
+            for character in full {
+                let candidate = title + String(character)
+                if textWidth(candidate + "…") > rotationTextWidth { break }
+                title = candidate
+            }
+            title += "…"
+        }
+        item.length = ceil(rotationTextWidth) + (button.image?.size.width ?? 0) + 18
+        button.title = " " + title
+        button.imagePosition = .imageLeading
+        button.toolTip = full + "\n" + stateItem.title
+    }
+
+    private func textWidth(_ text: String) -> CGFloat {
+        let font = statusItem?.button?.font ?? NSFont.menuBarFont(ofSize: 0)
+        return (text as NSString).size(withAttributes: [.font: font]).width
     }
 
     @objc private func toggleRotation(_ sender: NSMenuItem) {
@@ -107,15 +148,30 @@ public final class TodoController: NSObject {
     @objc private func toggleAutomaticSync(_ sender: NSMenuItem) {
         defaults.set(!automaticSyncEnabled, forKey: "TodoAutomaticSync")
         sender.state = automaticSyncEnabled ? .on : .off
-        configureAutomaticSync()
+        configureAutomaticSync(immediate: true)
     }
 
-    private func configureAutomaticSync() {
+    private func rebuildList() {
+        listItem.title = "待办列表（\(titles.count)）"
+        listMenu.removeAllItems()
+        for title in titles.isEmpty ? [hasSnapshot ? "暂无未完成待办" : "尚未读取待办"] : titles {
+            listMenu.addItem(withTitle: title, action: nil, keyEquivalent: "").isEnabled = false
+        }
+    }
+
+    private func configureAutomaticSync(immediate: Bool = false, afterAttempt: Bool = false) {
         automaticSyncTimer?.invalidate()
         automaticSyncTimer = nil
-        guard automaticSyncEnabled else { return }
-        let timer = Timer(timeInterval: 30 * 60, target: self,
-                          selector: #selector(automaticSync), userInfo: nil, repeats: true)
+        let last = defaults.object(forKey: "TodoLastSuccess") as? Date
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        let previous = last.map { "上次成功 " + clock.string(from: $0) } ?? "尚无成功记录"
+        scheduleItem.title = previous + (automaticSyncEnabled ? " · 等待授权" : " · 自动同步已关闭")
+        guard !stopped, automaticSyncEnabled, authorized else { return }
+        let now = Date()
+        let next = immediate ? now : (afterAttempt ? now.addingTimeInterval(1800) : max(now, last?.addingTimeInterval(1800) ?? now))
+        scheduleItem.title = previous + " · 下次 " + clock.string(from: next)
+        let timer = Timer(fireAt: next, interval: 0, target: self, selector: #selector(automaticSync), userInfo: nil, repeats: false)
         automaticSyncTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -123,6 +179,12 @@ public final class TodoController: NSObject {
     @objc private func automaticSync() {
         guard automaticSyncEnabled, operation == nil else { return }
         sync()
+    }
+
+    @objc private func openAutomation() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func openAuthorization() {
@@ -133,7 +195,7 @@ public final class TodoController: NSObject {
         busy(true)
         stateItem.title = "正在申请授权…"
         operation = Task {
-            defer { operation = nil; busy(false); updateLabel() }
+            defer { operation = nil; busy(false); configureAutomaticSync(); updateLabel() }
             do {
                 let auth = try await client.beginAuthorization()
                 authorizationURL = auth.verificationURL
@@ -141,7 +203,8 @@ public final class TodoController: NSObject {
                 stateItem.title = "等待钉钉授权：" + auth.userCode
                 openAuthorization()
                 try await client.finishAuthorization(auth)
-                stateItem.title = "授权成功，请点击「立即同步」"
+                authorized = true
+                stateItem.title = "授权成功"
             } catch is CancellationError { stateItem.title = "授权已取消" }
             catch { stateItem.title = error.localizedDescription }
             authorizationURL = nil
@@ -151,22 +214,33 @@ public final class TodoController: NSObject {
     @objc private func sync() {
         guard operation == nil else { return }
         busy(true)
+        stateItem.toolTip = nil
         let writeNotes = notesEnabled
         stateItem.title = "正在读取待办…"
         operation = Task {
-            defer { operation = nil; busy(false); updateLabel() }
+            defer { operation = nil; busy(false); configureAutomaticSync(afterAttempt: true); updateLabel() }
             do {
                 let snapshot = try await client.readTodos()
                 try Task.checkCancellation()
                 titles = snapshot.titles
                 cursor = 0
-                titleItem.title = titles.first ?? "暂无未完成待办"
+                hasSnapshot = true
+                rotationTextWidth = min(136, titles.map(textWidth).max() ?? 0)
+                rebuildList()
                 updateLabel()
                 if writeNotes {
                     stateItem.title = "已读取 \(titles.count) 条，正在写入备忘录…"
-                    let result = try await writeToNotes(snapshot)
-                    stateItem.title = result
+                    do {
+                        stateItem.title = try await writeToNotes(snapshot)
+                        permissionItem.isHidden = true
+                    } catch is CancellationError { throw CancellationError() }
+                    catch {
+                        stateItem.title = "已读取 \(titles.count) 条 · 备忘录写入失败"
+                        stateItem.toolTip = error.localizedDescription
+                        return
+                    }
                 } else { stateItem.title = "已读取 \(titles.count) 条待办（未写入备忘录）" }
+                defaults.set(Date(), forKey: "TodoLastSuccess")
             } catch is CancellationError { stateItem.title = "操作已取消；备忘录可能已部分更新，可重新同步" }
             catch { stateItem.title = error.localizedDescription }
         }
@@ -195,6 +269,7 @@ public final class TodoController: NSObject {
         }
         try Task.checkCancellation()
         let message = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        permissionItem.isHidden = status != 77
         guard status == 0 else { throw DingTalkError(message: message.isEmpty ? "待办已读取，但备忘录写入失败。" : message) }
         return message.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -208,5 +283,5 @@ public final class TodoController: NSObject {
         script?.executeAndReturnError(&error)
         if error != nil { stateItem.title = "无法打开同步文件夹，请先完成一次备忘录同步。" }
     }
-    @objc public func stop() { rotation?.invalidate(); automaticSyncTimer?.invalidate(); cancel() }
+    @objc public func stop() { stopped = true; rotation?.invalidate(); automaticSyncTimer?.invalidate(); cancel() }
 }
