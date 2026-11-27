@@ -65,14 +65,12 @@ public final class TodoController: NSObject {
         cancelItem = add("取消当前操作", #selector(cancel), to: menu)
         permissionItem = add("打开自动化设置", #selector(openAutomation), to: menu)
         permissionItem.isHidden = true
-        let settings = NSMenu()
-        settings.autoenablesItems = false
-        menu.addItem(withTitle: "待办设置", action: nil, keyEquivalent: "").submenu = settings
-        add("轮播待办标题", #selector(toggleRotation(_:)), to: settings).state = rotates ? .on : .off
-        add("每半小时自动同步", #selector(toggleAutomaticSync(_:)), to: settings).state = automaticSyncEnabled ? .on : .off
-        add("同步到备忘录", #selector(toggleNotes(_:)), to: settings).state = notesEnabled ? .on : .off
-        reauthItem = add("重新授权", #selector(authorize), to: settings)
-        add("打开钉钉待办同步文件夹", #selector(openNotes), to: settings)
+        menu.addItem(.separator())
+        add("轮播待办标题", #selector(toggleRotation(_:)), to: menu).state = rotates ? .on : .off
+        add("每半小时自动同步", #selector(toggleAutomaticSync(_:)), to: menu).state = automaticSyncEnabled ? .on : .off
+        add("同步到备忘录", #selector(toggleNotes(_:)), to: menu).state = notesEnabled ? .on : .off
+        reauthItem = add("重新授权", #selector(authorize), to: menu)
+        add("打开钉钉待办同步文件夹", #selector(openNotes), to: menu)
         busy(false)
         configureAutomaticSync()
         rotation = Timer(timeInterval: 6, target: self, selector: #selector(rotate), userInfo: nil, repeats: true)
@@ -115,20 +113,25 @@ public final class TodoController: NSObject {
             return
         }
         let full = titles[cursor]
-        var title = full
-        if textWidth(full) > rotationTextWidth {
-            title = ""
-            for character in full {
-                let candidate = title + String(character)
-                if textWidth(candidate + "…") > rotationTextWidth { break }
-                title = candidate
-            }
-            title += "…"
-        }
+        let title = shortened(full, width: rotationTextWidth, font: button.font ?? NSFont.menuBarFont(ofSize: 0))
         item.length = ceil(rotationTextWidth) + (button.image?.size.width ?? 0) + 18
         button.title = " " + title
         button.imagePosition = .imageLeading
         button.toolTip = full + "\n" + stateItem.title
+    }
+
+    private func shortened(_ title: String, width: CGFloat, font: NSFont) -> String {
+        func fits(_ text: String) -> Bool {
+            (text as NSString).size(withAttributes: [.font: font]).width <= width
+        }
+        guard !fits(title) else { return title }
+        var prefix = ""
+        for character in title {
+            let candidate = prefix + String(character)
+            guard fits(candidate + "…") else { break }
+            prefix = candidate
+        }
+        return prefix + "…"
     }
 
     private func textWidth(_ text: String) -> CGFloat {
@@ -155,7 +158,11 @@ public final class TodoController: NSObject {
         listItem.title = "待办列表（\(titles.count)）"
         listMenu.removeAllItems()
         for title in titles.isEmpty ? [hasSnapshot ? "暂无未完成待办" : "尚未读取待办"] : titles {
-            listMenu.addItem(withTitle: title, action: nil, keyEquivalent: "").isEnabled = false
+            let line = title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            let preview = shortened(line, width: 300, font: listMenu.font ?? NSFont.menuFont(ofSize: 0))
+            let row = listMenu.addItem(withTitle: preview, action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            row.toolTip = preview == title ? nil : title
         }
     }
 
