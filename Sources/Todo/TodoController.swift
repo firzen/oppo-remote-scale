@@ -28,7 +28,7 @@ public final class TodoController: NSObject {
     private var linkItem: NSMenuItem!
     private let defaults = UserDefaults.standard
     private var automaticSyncEnabled: Bool { defaults.bool(forKey: "TodoAutomaticSync") }
-    private var rotates: Bool { defaults.object(forKey: "TodoRotation") as? Bool ?? true }
+    private var rotates: Bool { defaults.bool(forKey: "TodoRotation") }
     private var notesEnabled: Bool { defaults.object(forKey: "TodoNotesSync") as? Bool ?? true }
 
     public override init() {
@@ -113,11 +113,19 @@ public final class TodoController: NSObject {
             return
         }
         let full = titles[cursor]
-        let title = shortened(full, width: rotationTextWidth, font: button.font ?? NSFont.menuBarFont(ofSize: 0))
+        let title = shortened(previewLine(full), width: rotationTextWidth, font: button.font ?? NSFont.menuBarFont(ofSize: 0))
         item.length = ceil(rotationTextWidth) + (button.image?.size.width ?? 0) + 18
         button.title = " " + title
         button.imagePosition = .imageLeading
         button.toolTip = full + "\n" + stateItem.title
+    }
+
+    private func previewLine(_ title: String) -> String {
+        let lines = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(maxSplits: 1, whereSeparator: { $0.isNewline })
+        guard let first = lines.first else { return "" }
+        let line = first.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return lines.count > 1 ? line + "…" : line
     }
 
     private func shortened(_ title: String, width: CGFloat, font: NSFont) -> String {
@@ -158,7 +166,7 @@ public final class TodoController: NSObject {
         listItem.title = "待办列表（\(titles.count)）"
         listMenu.removeAllItems()
         for title in titles.isEmpty ? [hasSnapshot ? "暂无未完成待办" : "尚未读取待办"] : titles {
-            let line = title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            let line = previewLine(title)
             let preview = shortened(line, width: 300, font: listMenu.font ?? NSFont.menuFont(ofSize: 0))
             let row = listMenu.addItem(withTitle: preview, action: nil, keyEquivalent: "")
             row.isEnabled = false
@@ -232,7 +240,7 @@ public final class TodoController: NSObject {
                 titles = snapshot.titles
                 cursor = 0
                 hasSnapshot = true
-                rotationTextWidth = min(136, titles.map(textWidth).max() ?? 0)
+                rotationTextWidth = min(136, titles.map { textWidth(previewLine($0)) }.max() ?? 0)
                 rebuildList()
                 updateLabel()
                 if writeNotes {
