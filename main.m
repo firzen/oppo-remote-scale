@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import "TodoBridge.h"
 #import <CoreGraphics/CoreGraphics.h>
 #import <ColorSync/ColorSync.h>
 #import <IOKit/graphics/IOGraphicsTypes.h>
@@ -387,6 +388,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 @interface MenuController : NSObject <NSApplicationDelegate>
+@property (strong) TodoController *todoController;
 @property (strong) NSPanel *panel;
 @property (strong) NSStatusItem *statusItem;
 @property (strong) NSMenuItem *statusMenuLabel;
@@ -478,6 +480,9 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
     self.landscapeMenuItem.target = self;
     self.restoreMenuItem = [menu addItemWithTitle:@"恢复" action:@selector(restoreManually:) keyEquivalent:@""];
     self.restoreMenuItem.target = self;
+    [menu addItem:[NSMenuItem separatorItem]];
+    self.todoController = [TodoController new];
+    [self.todoController attachToMenu:menu statusItem:self.statusItem];
     [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *quit = [menu addItemWithTitle:@"退出助手" action:@selector(terminate:) keyEquivalent:@""];
     quit.target = NSApp;
@@ -1165,6 +1170,7 @@ static BOOL SessionIsUnlocked(NSDictionary *session) {
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self.todoController stop];
     [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self
                                                                name:NSWorkspaceDidActivateApplicationNotification
                                                              object:nil];
